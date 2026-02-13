@@ -7,6 +7,7 @@
 | 主題 | 說明 |
 |------|------|
 | [Blue/Green Deployments](./blue-green-deployments.md) | RDS 的零停機部署機制 |
+| [Replication](./replication.md) | RDS 與 Aurora 的所有複製機制 |
 
 ## 關於這個 Repo
 
