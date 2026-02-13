@@ -75,26 +75,123 @@ Blue/Green 的優點：
 
 ### Topology 複製
 
-建立 Blue/Green Deployment 時，AWS 會複製整個 Topology：
+建立 Blue/Green Deployment 時，AWS 會複製整個 Topology，包含以下項目：
+
+| 複製項目 | 說明 |
+|---------|------|
+| **Primary DB Instance** | 主要資料庫實例 |
+| **Read Replicas** | Blue 有幾個就複製幾個 |
+| **Multi-AZ Standby** | Blue 是 Multi-AZ → Green 也是 Multi-AZ（含 Standby） |
+| **Storage Configuration** | 儲存設定（類型、大小、IOPS）|
+| **Automated Backups** | 自動備份設定 |
+| **Performance Insights** | 效能監控設定 |
+| **Enhanced Monitoring** | 進階監控設定 |
+
+#### 三種 Topology 情境
+
+**情境一：Standalone（只有 Primary）**
 
 ```
-Blue (Production)              Green (Staging)
+Blue                           Green
 ┌─────────────────┐            ┌─────────────────┐
 │  Primary        │            │  Primary        │
-│  (db-prod)      │───────────►│  (db-prod-green)│
-└────────┬────────┘ Replication└─────────────────┘
-         │                              │
-         │                              │
-┌────────▼────────┐            ┌────────▼────────┐
-│  Read Replica   │            │  Read Replica   │
-│  (db-read)      │            │  (db-read-green)│
+│  (mydb1)        │───────────►│  (mydb1-green-  │
+│                 │ Replication│   abc123)        │
 └─────────────────┘            └─────────────────┘
 ```
 
-重點：
-- Primary **和** Read Replica 都會被複製
-- Blue 到 Green 之間會自動建立 Replication
-- Green 環境的 DB Instance 名稱會加上 `-green-<隨機字串>` 後綴
+**情境二：Primary + Read Replicas**
+
+```
+Blue                           Green
+┌─────────────────┐            ┌─────────────────┐
+│  Primary        │            │  Primary        │
+│  (mydb1)        │───────────►│  (mydb1-green-  │
+└────────┬────────┘ Replication│   abc123)        │
+         │                     └────────┬────────┘
+         │                              │
+┌────────▼────────┐            ┌────────▼────────┐
+│  Read Replica   │            │  Read Replica   │
+│  (mydb2)        │            │  (mydb2-green-  │
+└─────────────────┘            │   abc123)       │
+                               └─────────────────┘
+```
+
+**情境三：Multi-AZ + Read Replicas（含 Standby）**
+
+```
+Blue                           Green
+┌─────────────────┐            ┌─────────────────┐
+│  Primary        │            │  Primary        │
+│  (mydb1)        │───────────►│  (mydb1-green-  │
+│  [AZ-a]         │ Replication│   abc123)       │
+└───────┬─────────┘            │  [AZ-a]         │
+        │                      └───────┬─────────┘
+        │ Sync                         │ Sync
+        │ Replication                  │ Replication
+┌───────▼─────────┐            ┌───────▼─────────┐
+│  Standby        │            │  Standby        │
+│  [AZ-b]         │            │  [AZ-b]         │
+└─────────────────┘            └─────────────────┘
+        │                              │
+┌───────▼─────────┐            ┌───────▼─────────┐
+│  Read Replica   │            │  Read Replica   │
+│  (mydb2)        │            │  (mydb2-green-  │
+└─────────────────┘            │   abc123)       │
+                               └─────────────────┘
+```
+
+#### 命名規則
+
+建立時，Green 環境的 DB Identifier 加上 `-green-<隨機字串>` 後綴。
+
+Switchover 後重新命名（**整個 Topology 一起換**）：
+
+| 角色 | Switchover 前 | Switchover 後 |
+|------|-------------|-------------|
+| Green Primary | `mydb1-green-abc123` | → `mydb1` |
+| Green Replica | `mydb2-green-abc123` | → `mydb2` |
+| 舊 Blue Primary | `mydb1` | → `mydb1-old1` |
+| 舊 Blue Replica | `mydb2` | → `mydb2-old1` |
+
+> **重點**：不只 Primary 的 endpoint 換了，**Replica 的 endpoint 也一起換了**。應用程式如果有直連 Read Replica endpoint，也會自動切到新的 Green Replica。
+
+#### Read Replica 特殊規則
+
+**Storage 處理**：
+- Green 所有 Replica 的 **allocated storage** 會統一成 **Green Primary 的大小**
+- 其他 storage 參數（IOPS、storage type）繼承自對應的 Blue Replica
+- 原因：如果 Green Primary 升級了 storage，AWS 確保 Replica storage 不會比 Primary 小
+
+**Instance Class 升級限制**：
+- 建立時**只能升級 Primary 的 Instance Class**
+- Read Replica 預設繼承 Blue 環境的 Instance Class
+- Green 建好後，必須**手動**修改 Replica 的 Instance Class：
+
+```bash
+aws rds modify-db-instance \
+    --db-instance-identifier mydb2-green-abc123 \
+    --db-instance-class db.r6g.2xlarge \
+    --apply-immediately
+```
+
+> **坑**：如果忘了手動改，Switchover 後會出現大台 Primary 配小台 Replica 的情況。
+
+#### Single-AZ 轉 Multi-AZ
+
+- 建立 Blue/Green 時，可以將 Blue（Single-AZ）升級為 Green（Multi-AZ）
+- Storage initialization 會包含 **Standby node**，預熱資料時要考慮 Standby 也需要初始化
+- 這是測試 Multi-AZ 架構的好時機
+
+#### 建立本質
+
+Green 環境的建立流程：**Snapshot → Restore → Replication**
+
+1. 對 Blue 做 Snapshot
+2. 從 Snapshot Restore 出 Green 環境
+3. 建立 Blue → Green 的 Replication
+
+> **影響**：因為是從 Snapshot Restore，Green 使用 **Lazy Loading**（首次存取的 block 才會從 S3 載入）。這會導致初期查詢延遲較高，詳見[第 5 節：Lazy Loading](#lazy-loading--storage-initialization)。
 
 ### Replication 機制
 
@@ -179,11 +276,31 @@ AWS 會根據 Blue/Green 環境的版本組合自動決定使用哪種複製方�
 - Blue 環境必須處於 `available` 狀態
 - 不能有進行中的 Maintenance Window
 - 不能使用 RDS Proxy
+- **不支援使用 Secrets Manager 自動管理 Master Password**（這是常見的坑，因為很多人使用此功能）
 
 #### MySQL / MariaDB 特定
 - 必須啟用 Binary Logging
 - `binlog_format` 必須設為 `ROW`
 - 如果有 Read Replica，必須使用 GTID-based replication
+- **Event Scheduler 必須停用**：Green 環境的 `event_scheduler` 必須設為 `OFF`
+
+> **為什麼要停用 Event Scheduler？** Blue 的 Event 產生的 DML（如 `DELETE`、`UPDATE`）會透過 Replication 傳到 Green。如果 Green 也同時跑相同的 Event，會**重複執行**，導致資料不一致。
+>
+> ```sql
+> -- 範例：Blue 上的清理 Event
+> CREATE EVENT cleanup_temp
+> ON SCHEDULE EVERY 5 MINUTE
+> DO DELETE FROM temp_data WHERE created_at < NOW() - INTERVAL 1 HOUR;
+>
+> -- 如果 Green 也啟用了 Event Scheduler：
+> -- 1. Green 自己的 Event 跑了一次 DELETE
+> -- 2. Blue 的 DELETE 又透過 Replication 傳過來
+> -- → 資料不一致！
+> ```
+
+- **Custom Option Group 限制**：如果 Blue 有 custom option group，**不能同時做 major version upgrade**，必須分兩步：
+  1. 先建立 Blue/Green Deployment（不升級版本）
+  2. Green 建好後，再在 Green 環境裡做版本升級
 
 #### PostgreSQL 特定
 - 對於 Logical Replication，需要 `rds.logical_replication` = `1`
@@ -236,6 +353,8 @@ aws rds create-blue-green-deployment \
 
 ## 6. Switchover 流程
 
+> ⛔ **絕對不要手動 Promote Green！** 不要在 Green 環境的 Actions 選單選「Promote」。手動 Promote 會直接斷掉 Replication，Blue/Green Deployment 進入 **Invalid configuration** 狀態，只能刪除重建。**必須使用 Switchover 功能，不是 Promote**。
+
 ### Guardrails 檢查
 
 Switchover 開始前，AWS 會執行一系列檢查（稱為 Guardrails）：
@@ -249,6 +368,19 @@ Switchover 開始前，AWS 會執行一系列檢查（稱為 Guardrails）：
 | **Active DDL** | 確認沒有正在執行的 DDL 語句 |
 
 如果任一檢查失敗，Switchover 會被取消。
+
+#### Logical Replication 額外 Guardrail（PostgreSQL Major Upgrade）
+
+使用 Logical Replication 時，Guardrails 會額外檢查：
+- Green 環境有沒有收到**不該有的 DDL 變更**
+- 有沒有 **Large Object** 被修改
+
+如果偵測到上述問題：
+- Replication state 變成 **`Replication degraded`**
+- Switchover **不可用**
+- **唯一解法**：刪掉 Blue/Green Deployment 重建
+
+> **Switchover 失敗是安全的**：如果 Switchover 因任何原因中斷（timeout、guardrail 失敗），所有變更會被**回滾**。兩邊環境都不受影響，可以修正問題後重試。
 
 ### Switchover 步驟
 
@@ -288,19 +420,77 @@ Switchover 開始前，AWS 會執行一系列檢查（稱為 Guardrails）：
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-### 為什麼用 Endpoint 重新命名？
+### Switchover 後 Blue 變成 Read-Only
 
-傳統做法是用 DNS 切換，但 DNS 有 TTL 的問題：
-- 即使 TTL 設成 60 秒
-- 有些 Client 會 cache 更久
-- 導致部分 Client 還連到舊的 Server
+Switchover 完成後，舊的 Blue 環境會**自動變成 Read-Only**（防止應用程式誤寫舊 DB）。
 
-AWS 的做法是直接改 **Instance Identifier**：
+| 引擎 | 設定的參數 | 說明 |
+|------|----------|------|
+| **MySQL** | `read_only = 1`（可能加上 `super_read_only = 1`）| 透過 `rdsadmin` 帳號設定 |
+| **PostgreSQL** | `default_transaction_read_only = on` | 透過 `rdsadmin` 帳號設定 |
+
+**為什麼 read_only 對你的帳號有效？** 因為你的 master user 只有 `rds_superuser` 角色，**沒有**真正的 MySQL `SUPER` 或 PostgreSQL `superuser` 權限，所以無法繞過 read_only。詳見[附錄 A：RDS 內部帳號架構](#附錄-a-rds-內部帳號架構)。
+
+**如何恢復寫入**（不能直接用 SQL）：
+1. 修改 Parameter Group：`read_only = 0`（MySQL）或 `default_transaction_read_only = off`（PostgreSQL）
+2. Reboot Instance
+3. AWS 的 `rdsadmin` 帳號會套用新設定
+
+### Endpoint 重新命名與 DNS
+
+AWS 的做法是直接改 **Instance Identifier**，而不是 DNS 切換：
 - `mydb-green-xxx` 直接變成 `mydb`
 - Endpoint 格式是 `{instance-id}.xxx.{region}.rds.amazonaws.com`
 - 所以 Endpoint 自動就變了
 
-這樣就不用等 DNS TTL，可以做到秒級切換。
+#### DNS TTL：必須 ≤ 5 秒
+
+RDS DNS zone 預設 TTL 就是 **5 秒**（不是 60 秒！）。問題出在 Application 和 Network 層會「偷 cache」：
+
+```
+DNS 解析流程（每一層都可能 cache）：
+
+┌─────────┐    ┌──────────┐    ┌──────────────┐    ┌──────────────┐
+│  JVM    │ →  │  OS DNS  │ →  │  DNS Resolver│ →  │  RDS DNS     │
+│  Cache  │    │  Cache   │    │  (公司/ISP)  │    │  Zone        │
+│  ⚠️ 永久 │    │  因系統而異│    │  因設定而異  │    │  TTL = 5 秒  │
+└─────────┘    └──────────┘    └──────────────┘    └──────────────┘
+```
+
+**最常見的坑：JVM DNS Cache**
+
+Java 預設**永久 cache DNS**，Switchover 後 Java 應用還是連到舊的 Blue：
+
+```java
+// Java 預設行為：永久 cache！
+// networkaddress.cache.ttl = -1
+
+// 修正方式一：程式碼中設定
+java.security.Security.setProperty("networkaddress.cache.ttl", "5");
+
+// 修正方式二：在 java.security 檔案設定
+// networkaddress.cache.ttl=5
+```
+
+**其他需注意的 cache 層**：
+- **OS DNS Cache**：Linux `systemd-resolved`、macOS 內建 DNS cache
+- **Connection Pool**：HikariCP、PgBouncer 建立連線時記住 IP，之後不重新 DNS lookup
+  - 解法：設定 `maxLifetime`（HikariCP 建議 `maxLifetime = 1800000`，30 分鐘）
+- **中間 Network 設備**：公司 DNS resolver、Load Balancer、VPN gateway
+
+### Tag 行為
+
+Switchover 時，**Blue 的 tags 會覆蓋 Green 的所有 tags**。如果在 Green 測試期間加了 tags（如 `environment=staging`），Switchover 後會被 Blue 的 tags 蓋掉。建議所有重要 tags 在建立前就設定在 Blue 上。
+
+### PostgreSQL ANALYZE（Logical Replication）
+
+使用 Logical Replication 做 Major version upgrade 時，Switchover 前必須在所有 database 執行 `ANALYZE`：
+
+```sql
+ANALYZE;
+```
+
+**原因**：Logical Replication **不會同步** `pg_statistic`（query optimizer 的統計資料）。如果不跑 ANALYZE，Switchover 後 query optimizer 沒有統計資料，查詢效能可能暴跌。
 
 ### Timeout 設定
 
@@ -352,7 +542,31 @@ ORDER BY xact_start;
 
 ### 更新外部 Replicas (MySQL/MariaDB)
 
-如果你有外部的 Read Replica（不在 Blue/Green Topology 內），Switchover 後需要手動更新它們的 Replication 設定，指向新的 Primary。
+如果你有外部的 Read Replica（不在 Blue/Green Topology 內），Switchover 後需要手動更新。
+
+#### 完整流程
+
+**Step 1**：Switchover 後，Green DB instance 會發出一個 Event，內含 binary log 座標：
+
+```
+Binary log coordinates: file mysql-bin-changelog.000003, position 40134574
+```
+
+**Step 2**：去 RDS Console → Events 找到這個事件。
+
+**Step 3**：確保外部 Replica 已經 apply 完舊 Blue 的所有 binlog。
+
+**Step 4**：用座標重新指向新的 Primary：
+
+```sql
+-- MySQL 8.0.23+
+CHANGE REPLICATION SOURCE TO
+    SOURCE_HOST='{new-writer-endpoint}',
+    SOURCE_LOG_FILE='mysql-bin-changelog.000003',
+    SOURCE_LOG_POS=40134574;
+
+START REPLICA;
+```
 
 > **來源**: [Switching a Blue/Green Deployment](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/blue-green-deployments-switching.html)
 
@@ -413,6 +627,10 @@ aws rds delete-blue-green-deployment \
 | **加密狀態變更** | 不能從加密變非加密（或反過來）|
 | **降級版本** | 只能升級，不能降級 |
 | **每帳戶限制** | 同一帳戶同一 Region 最多 5 個 Blue/Green Deployments |
+| **IAM Roles 不自動複製** | DB instance 關聯的 IAM roles（如 `aws_s3` extension 用的）不會複製到 Green，Switchover 後需手動重新關聯 |
+| **Dedicated Log Volume (DLV)** | 如果啟用 DLV，**所有** DB instances（含 Read Replicas）都必須一致啟用，不能部分啟用 |
+| **Zero-ETL Integration** | 如果有和 Amazon Redshift 的 zero-ETL integration，Switchover 前**必須先刪除**，之後再重建 |
+| **DMS Task 不能延續** | Switchover 後 AWS DMS replication task 無法繼續，因為 Blue 的 checkpoint 在 Green 環境無效，必須用新的 checkpoint 重建 DMS task |
 
 ### MySQL 特定限制
 
@@ -443,7 +661,11 @@ aws rds delete-blue-green-deployment \
 | **Large Objects** | `bytea` 之外的 Large Objects 不會複製 |
 | **Sequence 值** | Sequence 的 last value 不會自動同步，需手動處理 |
 | **TRUNCATE** | `TRUNCATE` 指令不會複製（PG 11-14）|
-| **分區表限制** | 某些分區操作可能有問題 |
+| **DCL 不複製** | `GRANT`、`REVOKE` 等權限控制語句不會同步到 Green |
+| **Single-Threaded** | Logical Replication 的 apply process 是**單執行緒**的，高寫入量可能追不上，考慮改用 AWS DMS |
+| **Unlogged Tables** | Unlogged tables 不寫 WAL，在 Logical Replication 下**不會被複製到 Green** |
+| **Materialized Views** | Switchover 後 Green 的 Materialized Views **不會自動更新**，需手動 `REFRESH MATERIALIZED VIEW` |
+| **Partitioned Tables** | 部署期間**不能**對 partitioned tables 建立新的 partition（`CREATE TABLE` 是 DDL，不會複製） |
 
 ### Extension 限制
 
@@ -451,7 +673,7 @@ aws rds delete-blue-green-deployment \
 
 | Extension | 限制 |
 |-----------|------|
-| **pg_partman** | 必須在 Switchover 前停用自動維護 |
+| **pg_partman** | 必須在 **Blue 和 Green 都**停用自動維護（不只是 Green） |
 | **pg_cron** | 建議在 Green 環境停用排程任務 |
 | **pglogical** | 不相容，必須移除 |
 | **postgis** | Topology 相關功能可能有問題 |
@@ -512,15 +734,26 @@ binlog_format = ROW
 sync_binlog = 1  # 確保資料一致性
 ```
 
-#### 效能調校
+#### 降低 Replica Lag 的兩個手段
+
+如果 Green 的 Replica Lag 太高，可以考慮以下暫時措施：
+
+**手段一：調整 `innodb_flush_log_at_trx_commit`**
 
 ```
-# 在測試環境可以考慮放寬此設定以提高效能
-# 但在 Production 建議保持預設值 (1) 以確保資料安全
-innodb_flush_log_at_trx_commit = 1
+# 暫時設定（在 Green 環境）
+innodb_flush_log_at_trx_commit = 2
 ```
 
-**注意**：`innodb_flush_log_at_trx_commit = 2` 可以提高複製效能，但會降低資料安全性，請謹慎評估。
+- 減少每次 commit 的 fsync 次數，提升 replication apply 速度
+- ⚠️ **風險**：如果中間 crash，可能有 1 秒的 data loss，需要重建 Green
+- **Switchover 前務必改回 `1`**
+
+**手段二：暫時改為 Single-AZ**
+
+- 暫時把 Green 的 Multi-AZ 改成 Single-AZ
+- 減少寫入延遲（不用同步到 Standby），提高 replication throughput
+- **Switchover 前再改回 Multi-AZ**
 
 ### PostgreSQL 最佳化設定
 
@@ -536,8 +769,22 @@ max_wal_senders = 10
 # Logical Replication 需要
 wal_level = logical
 
-# 增加 WAL 保留時間，避免複製中斷
-wal_keep_size = 1024  # MB
+# 增加 WAL 保留大小，避免複製中斷
+# 建議值：1 TiB（如果有足夠 storage）
+# PostgreSQL 14+
+wal_keep_size = 1048576  # 1 TiB in MB
+# PostgreSQL 13 以下（用 segments 計算，每個 segment 16 MB）
+# wal_keep_segments = 65536
+
+# 避免 WAL sender/receiver 意外 timeout 重啟
+# Blue 環境設定：
+wal_sender_timeout = 0     # 停用 timeout
+
+# Green 環境設定：
+# wal_receiver_timeout = 0  # 停用 timeout
+
+# 增加 Logical Decoding 記憶體，減少 disk I/O
+logical_decoding_work_mem = 256  # MB，預設 65 MB
 ```
 
 #### 處理長時間交易
@@ -577,13 +824,41 @@ JOIN pg_sequences ps ON s.sequence_name = ps.sequencename;
 SELECT setval('your_sequence_name', <value_from_blue>);
 ```
 
+#### Trigger 注意事項（Logical Replication）
+
+如果 Green 環境有設定 `ENABLE REPLICA` 或 `ENABLE ALWAYS` 的 trigger：
+
+- Replication 會把資料變更傳過來
+- Trigger **也會**執行
+- 結果：**重複執行**（原始操作 + trigger 各做一次）
+
+**建議**：Switchover 前檢查並調整 Green 環境的 trigger 設定。
+
 ### DNS TTL 建議
 
-雖然 AWS 用 Endpoint 重新命名，但如果應用程式有自己的 DNS cache：
+> ⚠️ AWS 官方要求：DNS cache TTL **不能超過 5 秒**。
 
-- 把 TTL 設短一點（如 60 秒）
-- 或確保應用程式會遵守 DNS TTL
-- 考慮在應用程式層實作連線重試邏輯
+雖然 AWS 用 Endpoint 重新命名來實現切換，但應用程式和網路層的 DNS cache 仍然是最大的風險：
+
+- **JVM（最常見的坑）**：Java 預設**永久 cache DNS**，必須設定 `networkaddress.cache.ttl=5`
+- **Connection Pool**：設定合理的 `maxLifetime`
+- **OS DNS Cache**：確認沒有設定過長的 cache TTL
+- 確保應用程式有連線重試邏輯
+
+> 詳細的 DNS cache 問題分析和修正方式，見[第 6 節：Endpoint 重新命名與 DNS](#endpoint-重新命名與-dns)。
+
+### CloudWatch 監控指標
+
+建議在部署期間持續監控以下指標：
+
+| Metric | 說明 | 注意事項 |
+|--------|------|---------|
+| `ReplicaLag` | Blue 到 Green 的延遲 | Switchover 前必須接近 0 |
+| `ReplicationSlotDiskUsage` | Replication slot 使用的磁碟空間 | 持續增長表示 Green 追不上 |
+| `OldestReplicationSlotLag` | 最老的 replication slot 的 lag | 監控 logical replication 健康度 |
+| `FreeableMemory` | 可用記憶體 | Logical decoding 會消耗額外記憶體 |
+| `DatabaseConnections` | 連線數量 | Switchover 時會歸零再恢復 |
+| `CPUUtilization` | CPU 使用率 | Replication 會增加 CPU 負載 |
 
 > **來源**: [Blue/Green Deployment Best Practices](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/blue-green-deployments-best-practices.html)
 
@@ -714,6 +989,129 @@ Green 環境存在 7 天的額外費用約：
 - 總計: ~$56
 
 （實際費用請參考 AWS 官方定價）
+
+---
+
+## 附錄 A: RDS 內部帳號架構
+
+### rdsadmin 帳號
+
+`rdsadmin` 是 AWS 植入在**每個 RDS instance** 裡的內部管理帳號。你看不到它的完整權限，也無法用它登入。
+
+#### RDS Instance 建立流程
+
+```
+你按下 "Create Database"
+        │
+        ▼
+┌───────────────────────────────────────┐
+│ 1. AWS 啟動一台 EC2（你看不到）         │
+│ 2. 在上面安裝 MySQL/PostgreSQL         │
+│ 3. 用真正的 root 建立 rdsadmin 帳號     │
+│ 4. 鎖死真正的 root（不再讓任何人用）     │
+│ 5. 建立你的 master user                 │
+│ 6. 給 master user rds_superuser 角色   │
+│ 7. 回傳 endpoint 給你                   │
+└───────────────────────────────────────┘
+```
+
+### 權限層級架構
+
+```
+┌──────────────────────────┐
+│  rdsadmin (AWS 內部)      │ ← 真正的 root/superuser，你看不到
+│  有完整 SUPER 權限         │
+├──────────────────────────┤
+│  你的 master user          │ ← 你能用的最高權限
+│  rds_superuser 角色        │ ← 不是真正的 SUPER/superuser
+├──────────────────────────┤
+│  一般應用程式帳號           │
+└──────────────────────────┘
+```
+
+**核心概念**：RDS **不會**給你真正的 MySQL `root` 或 PostgreSQL `superuser`。你的 master user 有 `rds_superuser` 角色，但沒有 `SUPER` privilege。
+
+### rdsadmin 的工作
+
+| 工作 | 說明 |
+|------|------|
+| **自動備份** | 每天的 automated backup |
+| **Monitoring** | 收集 metrics 送到 CloudWatch |
+| **Maintenance** | OS patching、minor version upgrade |
+| **Replication 管理** | Blue/Green 的 replication 設定 |
+| **Parameter 套用** | 當你改 Parameter Group 時，rdsadmin 去執行 |
+| **Read-only 控制** | Switchover 後設定 `read_only` |
+
+### 為什麼 read_only 對你有效
+
+#### MySQL 的兩層 Read-Only
+
+| 參數 | 擋誰 | 說明 |
+|------|------|------|
+| `read_only = 1` | 擋一般用戶 | 有 SUPER 權限的用戶**不受影響** |
+| `super_read_only = 1` | 擋所有人 | 連 SUPER 權限的用戶也不能寫 |
+
+因為你的 master user **沒有 SUPER 權限**，所以 `read_only = 1` 就足以擋住你。
+
+#### 你不能直接用 SQL 關掉 read_only
+
+```sql
+-- MySQL
+SET GLOBAL read_only = 0;
+-- ❌ ERROR: 你沒有 SUPER 權限
+
+-- PostgreSQL
+SET default_transaction_read_only = off;
+-- ❌ 你不是 superuser
+```
+
+必須透過 Parameter Group 修改 + Reboot。
+
+### MySQL Master User 沒有的權限
+
+| 缺少的權限 | 影響 |
+|-----------|------|
+| `SUPER` | 不能設定全域變數、不能 kill 其他人的 connection |
+| `FILE` | 不能直接讀寫 server 上的檔案 |
+| `SHUTDOWN` | 不能關掉 database |
+
+### MySQL Stored Procedures（替代 SUPER 功能）
+
+AWS 提供了 stored procedures 來替代你缺少的 SUPER 權限：
+
+```sql
+-- 替代 KILL（因為你沒有 SUPER 權限）
+CALL mysql.rds_kill(thread_id);
+
+-- 替代直接設定 replication
+CALL mysql.rds_set_external_source(...);
+```
+
+### PostgreSQL Master User 權限細節
+
+```sql
+-- rdsadmin 是真正的 superuser
+SELECT usename, usesuper FROM pg_user WHERE usename = 'rdsadmin';
+-- rdsadmin | true
+
+-- 你的 master user 不是 superuser
+SELECT usename, usesuper FROM pg_user WHERE usename = 'myuser';
+-- myuser | false
+
+-- 但你有 rds_superuser 角色
+SELECT rolname FROM pg_roles WHERE oid IN (
+    SELECT member FROM pg_auth_members WHERE roleid = (
+        SELECT oid FROM pg_roles WHERE rolname = 'rds_superuser'
+    )
+);
+-- myuser
+```
+
+**rds_superuser 不能做的事**：
+- `CREATE EXTENSION` 任意 extension（只能裝 AWS 白名單內的）
+- 直接操作 `pg_catalog`
+- 修改 `rdsadmin` 的權限
+- 存取 OS file system
 
 ---
 
