@@ -28,6 +28,32 @@ Blue/Green 的優點：
 - 出問題可以快速切回 Blue
 - 減少升級風險
 
+### 常見問題
+
+**Q: Switchover 後需要更改 Connection String 嗎？**
+
+**不需要。** AWS 會自動重新命名 Green 環境的 endpoint，使其與 Blue 環境完全一致，應用程式不需要做任何變更。
+
+> "RDS also renames the endpoints in the green environment to match the corresponding endpoints in the blue environment so that application changes aren't required."
+> — [Switching over a Blue/Green Deployment](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/blue-green-deployments-switching.html)
+
+> "The names and endpoints in the current production environment are assigned to the newly switched over production environment, requiring no changes to your application."
+> — [Blue/Green Deployments Overview](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/blue-green-deployments-overview.html)
+
+> ⚠️ **但 DNS cache 是隱患！** "Make sure that your network and client configurations don't increase the DNS cache Time-To-Live (TTL) beyond five seconds..." 確保所有層級的 DNS cache TTL ≤ 5 秒，否則切換後可能仍連到舊 IP。詳見[第 6 節：Endpoint 重新命名與 DNS](#endpoint-重新命名與-dns)。
+
+**Q: 如何提前在 Green 環境測試？**
+
+Green 環境建立後會有**獨立的臨時 endpoint**（格式為 `{instance-id}-green-{隨機字串}.xxx.{region}.rds.amazonaws.com`），可以直接連線進行測試。
+
+> "You can make changes to the RDS DB instances in the green environment without affecting production workloads. ... You can thoroughly test changes in the green environment."
+> — [Blue/Green Deployments Overview](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/blue-green-deployments-overview.html)
+
+> ⚠️ **測試時建議保持 Green 為唯讀：** "During testing, we recommend that you keep your databases in the green environment read only. Enable write operations on the green environment with caution because they can result in replication conflicts."
+> — [Blue/Green Deployments Best Practices](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/blue-green-deployments-best-practices.html)
+
+> ⚠️ **測試前記得做 Storage Initialization（預熱）：** "After you create the blue/green deployment, handle lazy loading if necessary. Make sure data loading is complete before switching over." 因為 Green 是從 Snapshot Restore 建立的，使用 Lazy Loading，首次存取的 block 才會從 S3 載入，會導致初期查詢延遲較高。詳見[第 5 節：Lazy Loading](#lazy-loading--storage-initialization)。
+
 > **來源**: [Blue/Green Deployments Overview](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/blue-green-deployments-overview.html)
 
 ---
@@ -712,9 +738,16 @@ Switchover 完成後，以下資源可能需要手動更新：
 
 #### 測試建議
 
+> "You can make changes to the RDS DB instances in the green environment without affecting production workloads. ... You can thoroughly test changes in the green environment."
+> — [Blue/Green Deployments Overview](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/blue-green-deployments-overview.html)
+
 1. **功能測試**：在 Green 環境執行應用程式的關鍵功能測試
 2. **效能測試**：比較 Blue 和 Green 的查詢效能
 3. **連線測試**：確認應用程式可以正確連線到 Green
+
+> ⚠️ "During testing, we recommend that you keep your databases in the green environment read only. Enable write operations on the green environment with caution because they can result in replication conflicts."
+
+> ⚠️ "After you create the blue/green deployment, handle lazy loading if necessary. Make sure data loading is complete before switching over." — 測試前務必完成 Storage Initialization，否則效能測試結果不準確。
 
 ### MySQL 最佳化設定
 
