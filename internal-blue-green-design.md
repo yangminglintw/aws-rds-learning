@@ -191,6 +191,64 @@
 
 > **評估**：Option B 在營運上較簡單且省資源，但 **DR 缺口是真實風險**。如果 SLA 允許計畫性維護時暫時失去 DR（例如有維護窗口），Option B 很有吸引力。如果 DR 必須隨時存在，Option A 更安全。Option C 是折衷方案。
 
+#### 與 AWS RDS Blue/Green 的對照
+
+**結論：Option A 是 AWS-like 的做法；Option B 沒有 AWS 對應物。**
+
+AWS RDS Blue/Green 的核心流程是：
+
+```
+Snapshot Blue → Restore 為 Green → 自動建立 binlog Replication → 測試 → Switchover（endpoint rename）→ 舊 Blue 保留
+```
+
+這直接對應 **Option A**——建立全新 Green 環境、Blue → Green Replication 同步、DR 全程保持完整、Switchover 後舊 Blue 保留作為 Rollback、Primary Zone 不改變。AWS 不會把 DR / Read Replica 拿來當 Green 用，因此 **Option B 沒有 AWS 對應物**。
+
+##### AWS 自動化 vs 自建環境的差距
+
+以下比較 AWS 全自動化流程與典型自建環境（使用 mariadb-operator 管理 semi-sync cluster，跨 Zone async replication 使用腳本）的能力差距：
+
+| 生命週期階段 | AWS 自動完成 | 自建環境典型能力 | 需要補足的缺口 |
+|------------|-------------|----------------|--------------|
+| **1. Snapshot/Backup** | 自動 Snapshot | 有 backup/restore 腳本，但通常針對特定場景 | 需通用化，支援同 Zone 的 Blue→Green 備份 |
+| **2. 建立 Green 實例** | 自動從 Snapshot Restore 為新 DB instance | 手動建立 MariaDB CR YAML | 需設計 Green CR 生成方式（見下方問題清單） |
+| **3. Blue→Green Replication** | 自動配置 binlog replication | 有 `CHANGE MASTER TO` 經驗，但通常僅限跨 Zone | 腳本需支援同 Zone 的 Blue→Green Replication |
+| **4. Green 環境驗證** | 提供臨時 endpoint 供測試 | 通常沒有標準化流程 | 需設計臨時 Service + Smoke Test 流程 |
+| **5. Switchover** | 自動 endpoint rename + connection drain | 已設計（Decision 3 的 Layer 2 切換） | 已有方案，需實作 |
+| **6. Rollback** | 自動支援 Switchover 失敗回退 | 通常沒有標準化流程 | 需設計 Rollback 腳本和判斷標準 |
+| **7. 清理（刪除舊 Blue）** | 手動刪除（使用者決定） | 刪除 CR/PVC 即可 | 無重大缺口 |
+
+##### 自建環境需要回答的問題清單
+
+選擇 Option A 時，自建環境需要回答以下問題。每個問題都有多種方案可選，建議分階段演進：
+
+**部署面（Deploy）**
+
+| # | 問題 | 可選方案（由簡到繁） | 建議起步 |
+|---|------|-------------------|---------|
+| 1 | **Green CR 如何生成？** | 手動複製 YAML → Shell Script 修改欄位 → Kustomize overlay → Helm chart | 手動複製 YAML 或 Shell Script |
+| 2 | **PVC 資料怎麼來？** | Backup + Restore → Volume Snapshot Clone → 全新實例 + Replication 追趕 | 對應 Decision 1 |
+
+> Green CR 可放同 Namespace——前提是 operator 支援同 Namespace 多個 MariaDB CR（mariadb-operator 社群版支援此功能）。
+
+**控制面（Control）**
+
+| # | 問題 | 可選方案（由簡到繁） | 建議起步 |
+|---|------|-------------------|---------|
+| 3 | **Blue→Green Replication 如何管理？** | Shell Script（參數化 `CHANGE MASTER TO`）→ K8s Job → Ansible Playbook → 自訂 CRD + Controller | Shell Script 搭配 Runbook |
+| 4 | **整個 Blue/Green 流程用什麼驅動？** | Runbook + Shell Script → Makefile/Taskfile → Argo Workflows / Tekton → 自訂 K8s Controller | Runbook + Shell Script |
+| 5 | **Green 環境如何監控？** | Script 輪詢（`SHOW SLAVE STATUS`）→ Prometheus + mysqld_exporter → 完整 Grafana Dashboard | 已有 Prometheus 則直接使用，否則 Script 輪詢 |
+
+**建議演進路線**
+
+| 階段 | CR 生成 | PVC 資料 | Replication 管理 | 流程驅動 | 監控 |
+|------|---------|---------|-----------------|---------|------|
+| **Phase 1：手動驗證** | 手動複製 YAML | Backup + Restore | Shell Script | Runbook + Script | Script 輪詢 |
+| **Phase 2：腳本化** | Shell Script | Volume Snapshot（如支援） | K8s Job | Makefile/Taskfile | Prometheus Stack |
+| **Phase 3：自動化** | Kustomize 或 Helm | Volume Snapshot | K8s Job | Argo Workflows | Prometheus + Grafana |
+| **Phase 4：平台化** | Helm + ArgoCD | Volume Snapshot | 自訂 CRD | 自訂 Controller | 完整 Observability |
+
+> 每個問題可以獨立演進——不需要所有問題同時進入下一階段。例如可以先把監控升級到 Prometheus，而流程驅動還停留在 Runbook。
+
 ---
 
 ### Decision 1：Green 環境初始化策略
@@ -507,7 +565,7 @@ Zone-A 變成新的 DR。Replication 方向反轉。
 
 | 風險項目 | AWS RDS 如何處理 | 自建環境需要自行處理 |
 |---------|-----------------|-----------------|
-| Green 環境建立 | AWS 自動從 Snapshot 建立 | 需自行管理 PVC Snapshot 或 Backup/Restore |
+| Green 環境建立 | AWS 自動從 Snapshot 建立，包含 CR 生成、資料還原、Replication 設定一條龍 | 有 operator 管理 cluster、有跨 Zone 腳本，但缺少整合的 Green 環境建立流程——CR 生成、同 Zone Replication、驗證等步驟需逐一補足（見 Decision 0 差距分析） |
 | Replication 設定 | AWS 自動配置 binlog replication | 需手動或腳本執行 `CHANGE MASTER` |
 | Switchover 原子性 | AWS 使用 DNS CNAME flip（通常 < 1 分鐘） | 需自行管理 K8s Service selector + Ingress Gateway |
 | Rollback | AWS 支援 Switchover 失敗自動回退 | 需自行設計 Rollback 流程 |
