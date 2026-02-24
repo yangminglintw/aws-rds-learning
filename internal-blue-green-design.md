@@ -1,0 +1,609 @@
+# Self-Hosted DBaaS Blue/Green Deployment 設計文件
+
+這篇筆記探討在 Kubernetes 上運行 MariaDB（透過 mariadb-operator）時，如何設計 Blue/Green Deployment 流程。目標是參考 AWS RDS Blue/Green Deployment 的概念，為自建多租戶 DBaaS 提供**零停機**的版本升級、設定變更與 Schema Migration 能力。
+
+> **背景**：與 AWS RDS 不同，自建的 Kubernetes 叢集使用 [mariadb-operator/mariadb-operator](https://github.com/mariadb-operator/mariadb-operator)（社群版）來管理 MariaDB 實例。因此無法直接使用 AWS 提供的 Blue/Green API，需要自行設計對應的流程。
+
+---
+
+## 1. 目前架構
+
+### 整體拓撲
+
+```
+┌─── App K8s Cluster(s) ───┐
+│                           │
+│   App-A    App-B   App-C  │
+│     │        │       │    │
+└─────┼────────┼───────┼────┘
+      │        │       │
+      ▼        ▼       ▼
+  ┌─────────────────────────┐
+  │    Ingress Gateway       │  ◄── 跨叢集連線入口
+  └────────────┬────────────┘
+               │
+┌──────────────┼── DB K8s Cluster ──────────────────────┐
+│              ▼                                         │
+│  ┌──────────── Zone-A (Primary Zone) ────────────┐       │
+│  │                                             │       │
+│  │   Primary ──semi-sync──► Replica-1          │       │
+│  │            └─semi-sync──► Replica-2         │       │
+│  │                                             │       │
+│  └──────────────────┬──────────────────────────┘       │
+│                     │ async (GTID-based)               │
+│                     ▼                                  │
+│  ┌──────────── Zone-B (DR Zone) ─────────────────┐       │
+│  │                                             │       │
+│  │   Primary ──semi-sync──► Replica-1          │       │
+│  │            └─semi-sync──► Replica-2         │       │
+│  │                                             │       │
+│  └─────────────────────────────────────────────┘       │
+│                                                        │
+└────────────────────────────────────────────────────────┘
+```
+
+### 架構要點
+
+| 項目 | 說明 |
+|------|------|
+| **連線方式** | App Cluster → Ingress Gateway（跨叢集）→ DB Cluster 內的 K8s Service → MariaDB Pods |
+| **Operator** | mariadb-operator/mariadb-operator（社群版） |
+| **Zone 內複製** | Semi-synchronous Replication（半同步） |
+| **跨 Zone 複製** | GTID-based Asynchronous Replication（非同步） |
+| **多租戶** | 同一 DB Cluster 上有多個團隊的 DB 實例 |
+| **關鍵細節** | DB 和 App 在**不同的 K8s Cluster** |
+
+> **與 AWS RDS 的對照**：AWS 的 Blue/Green 在底層也是使用 binlog replication 搭配 GTID 來同步 Blue 與 Green 環境。自建環境的設計思路相同，只是需要自行管理這些元件。
+
+---
+
+## 2. 資訊盤點清單
+
+在實作 Blue/Green 之前，需要先收集以下資訊。此清單可作為 **可填寫的模板** 供相關團隊或應用程式擁有者填寫。
+
+### A. 每個租戶 DB 的實例資訊
+
+| 項目 | 為什麼重要 | 填寫欄位 |
+|------|-----------|---------|
+| MariaDB 版本 | 決定升級路徑、GTID 相容性 | `___________` |
+| 實例規格（CPU/Memory requests & limits） | Green 環境需要相同或更大的資源 | `___________` |
+| 儲存大小 & StorageClass | 影響 clone/restore 時間和 PVC 佈建 | `___________` |
+| Replica 數量與拓撲 | Green 環境必須複製相同拓撲 | `___________` |
+| 自訂 `my.cnf` / ConfigMap 覆寫 | 需要帶到 Green 環境或在 Green 中變更 | `___________` |
+| 資料庫大小（GB） | 直接影響 Green 環境建立時間 | `___________` |
+| 連線的應用程式及其 Namespace | 需要通知應用程式負責人，確認 retry/reconnect 邏輯 | `___________` |
+
+### B. 平台層資訊
+
+| 項目 | 為什麼重要 | 填寫欄位 |
+|------|-----------|---------|
+| mariadb-operator 版本 & CRD schema | 決定可用功能（如同一 Namespace 是否支援多個 MariaDB CR） | `___________` |
+| K8s Cluster 版本 | 影響可用 API（如 Gateway API vs Ingress） | `___________` |
+| Storage Provisioner 能力 | 是否支援 Volume Cloning / Snapshot？（Green 環境快速建立的關鍵） | `___________` |
+| GTID 模式確認 | `gtid_strict_mode=ON`？這是可靠 Replication 串接的前提 | `___________` |
+| 備份策略 | 使用什麼工具？（mariabackup、mysqldump、operator 內建？） | `___________` |
+| 監控堆疊 | Prometheus metrics？有哪些 Replication Lag 的 Dashboard？ | `___________` |
+| CI/CD Pipeline | MariaDB CR 目前如何部署？（Helm？Kustomize？ArgoCD？） | `___________` |
+| Ingress Gateway 類型 & 設定 | 哪種 Gateway？（Istio、Envoy、Nginx 等）連線 timeout、health check、drain 設定 | `___________` |
+| 跨叢集網路 | App Cluster → DB Cluster 的連線如何建立？（VPN、Peering、Service Mesh？） | `___________` |
+
+### C. 應用程式端資訊（每個租戶）
+
+| 項目 | 為什麼重要 | 填寫欄位 |
+|------|-----------|---------|
+| Connection String 格式 | 使用 Ingress Gateway endpoint？Service DNS？IP？Switchover 如何影響？ | `___________` |
+| Connection Pool Library & 設定 | Pool size、max idle time、connection lifetime、validation query | `___________` |
+| Retry/Reconnect 行為 | App 斷線後會重試嗎？多快？ | `___________` |
+| Read/Write Split | App 是否從 Replica 讀取？如何做？（獨立 Service？ProxySQL？） | `___________` |
+| 可接受的停機窗口 | 即使「零停機」，Switchover 仍需短暫暫停寫入——可容忍多久？（1s？5s？30s？） | `___________` |
+| Migration 工具 | App Team 用什麼做 Schema 變更？（Flyway？Liquibase？手動 SQL？） | `___________` |
+
+### D. 營運限制
+
+| 項目 | 為什麼重要 | 填寫欄位 |
+|------|-----------|---------|
+| Cluster 剩餘資源 | Green 環境會暫時加倍資源使用——是否有足夠空間？ | `___________` |
+| 維護窗口 | Switchover 可以在什麼時間執行？有沒有封鎖期？ | `___________` |
+| 變更管理流程 | 誰批准？Rollback 權限是什麼？ | `___________` |
+| Zone-B SLA | Switchover 期間 Zone-B 的 Replication 會暫時中斷——可接受的最大間隔是多久？ | `___________` |
+
+---
+
+## 3. 關鍵設計決策
+
+### Decision 0（最關鍵）：Blue/Green 策略——建立新叢集 vs 重用 Zone-B
+
+這是最重要的架構決策，有兩種根本不同的路線。
+
+#### Option A：建立新的 Green Cluster（經典 Blue/Green）
+
+```
+[BEFORE]
+  Zone-A (Blue) 1P+2R ──async──► Zone-B (DR) 1P+2R
+  ▲ Apps 連到這裡
+
+[DURING]
+  Zone-A (Blue) 1P+2R ──async──► Zone-B (DR) 1P+2R
+  ▲ Apps            └──GTID──► Zone-A (Green) 1P+2R  ◄── 新建，升級版本
+
+[AFTER SWITCHOVER]
+  Zone-A (Green) 1P+2R ──async──► Zone-B (DR) 1P+2R    ◄── Zone-B 重新指向 Green
+  ▲ Apps 連到這裡
+  Zone-A (old Blue) → 刪除
+```
+
+| 優點 | 缺點 |
+|------|------|
+| Zone-B DR 在整個過程中保持完整 | 暫時需要 3 倍資源（Blue + Green + Zone-B） |
+| 乾淨的 Rollback——直接切回 Blue | 需要佈建新叢集、還原資料 |
+| Zone-B 只在 Switchover 成功後才重新指向 | 設置較複雜 |
+
+#### Option B：將 Zone-B (DR) 重新作為 Green
+
+```
+[BEFORE]
+  Zone-A (Blue) 1P+2R ──async──► Zone-B (DR) 1P+2R
+  ▲ Apps 連到這裡
+
+[STEP 1 — 升級 Zone-B]
+  Zone-A (Blue) 1P+2R ──async──► Zone-B (Green) 1P+2R  ◄── 就地升級或重建
+  ▲ Apps              Replication 追上後同步
+
+[STEP 2 — Switchover]
+  Zone-A (old Blue) 1P+2R        Zone-B (Green) 1P+2R
+                                ▲ Apps 透過 Ingress Gateway 連到這裡
+
+[STEP 3 — 重建 DR]
+  Zone-A (new DR) 1P+2R ◄──async── Zone-B (Green/Primary) 1P+2R
+                                  ▲ Apps 連到這裡
+```
+
+| 優點 | 缺點 |
+|------|------|
+| 不需要額外資源——重用現有 Zone-B | **升級 + Switchover 窗口期間 DR 消失** |
+| Zone-B 已經有所有資料 | Zone-B 在不同 Zone——App 可能感受延遲變化 |
+| 較簡單——不需要佈建新叢集 | Switchover 後 Primary 在 Zone-B（Zone 改變！） |
+| GTID 讓 Replication 重新指向很乾淨 | 之後必須重建 Zone-A 作為新的 DR |
+| | Rollback 較困難——需要把 Zone 切回來 |
+| | 如果 Zone-B 升級失敗，DR 和 Blue/Green 都受影響 |
+
+#### Option C（混合方案）：升級期間建立臨時最小 DR
+
+```
+[DURING Zone-B UPGRADE]
+  Zone-A (Blue) 1P+2R ──async──► Temp-DR (1P+0R)    ◄── 臨時最小 DR
+                               Zone-B 升級中...
+
+[AFTER SWITCHOVER]
+  Zone-A (new DR) 1P+2R ◄──async── Zone-B (Green/Primary) 1P+2R
+  Temp-DR → 刪除
+```
+
+#### 選擇考量
+
+| 問題 | Option A | Option B | Option C |
+|------|----------|----------|----------|
+| 升級期間 DR 是否存在？ | ✅ 完整 DR | ❌ DR 中斷 | ⚠️ 臨時最小 DR |
+| 資源需求 | 3x（最多） | 1x（不增加） | ~1.3x |
+| Rollback 難度 | 低（切回 Blue） | 高（需要切 Zone） | 中 |
+| Primary Zone 是否改變？ | 否 | 是（移到 Zone-B） | 是（移到 Zone-B） |
+| 實作複雜度 | 高 | 低 | 中 |
+
+> **評估**：Option B 在營運上較簡單且省資源，但 **DR 缺口是真實風險**。如果 SLA 允許計畫性維護時暫時失去 DR（例如有維護窗口），Option B 很有吸引力。如果 DR 必須隨時存在，Option A 更安全。Option C 是折衷方案。
+
+---
+
+### Decision 1：Green 環境初始化策略
+
+*（主要適用於 Option A——Option B 可跳過此步驟，因為 Zone-B 已有資料）*
+
+| 選項 | 優點 | 缺點 | 適用場景 |
+|------|------|------|---------|
+| **A. Backup + Restore** | 簡單，流程成熟 | 大型 DB 很慢（100GB+ 需數小時） | Storage 不支援 Snapshot |
+| **B. Volume Snapshot Clone** | 快速（分鐘級），Storage 層操作 | 需要 CSI Snapshot 支援，相同 StorageClass | Storage 支援 Snapshot（**推薦**） |
+| **C. 全新實例 + GTID Replication 追趕** | 設置乾淨 | 大型資料集非常慢，網路負載重 | 小型 DB |
+
+> **建議**：優先使用 Volume Snapshot Clone（如果 Storage 支援），Backup + Restore 作為備選。
+
+---
+
+### Decision 2：Blue/Green 期間的 Replication 拓撲
+
+```
+Option A: 簡單鏈式（Simple Chain）
+  Blue Primary ──GTID async──► Green Primary ──semi-sync──► Green R1, R2
+
+Option B: 扇出式（Fan-out）
+  Blue Primary ──GTID async──► Green Primary
+  Blue Primary ──GTID async──► Green R1
+  Blue Primary ──GTID async──► Green R2
+```
+
+| 選項 | 優點 | 缺點 |
+|------|------|------|
+| **Simple Chain** | 符合 mariadb-operator 管理 Replication 的方式，Green 作為獨立 CR 管理 | Green Primary 是單點 |
+| **Fan-out** | Green Replica 直接從 Blue 同步，延遲更低 | 增加 Blue Primary 負載，且與 operator 管理模式衝突 |
+
+> **建議**：Option A（Simple Chain）——Green Cluster 由自己的 MariaDB CR 管理，Green Primary 從 Blue Primary 複製。
+
+---
+
+### Decision 3：Switchover 機制
+
+由於 App 透過 **Ingress Gateway**（跨叢集）連線，Switchover 有更多層次：
+
+```
+App Cluster → Ingress Gateway → [ K8s Service (DB Cluster) ] → MariaDB Pods
+                                  ^^^^^^^^^^^^^^^^^^^^^^^^^
+                                  流量在這裡切換
+```
+
+#### Switchover 步驟
+
+| 階段 | 使用 Ingress Gateway（現在） | 使用 ProxySQL（未來） |
+|------|---------------------------|----------------------|
+| **暫停寫入** | Blue Primary 設定 `SET GLOBAL read_only=ON` | ProxySQL: 暫停 write backend |
+| **等待同步** | 檢查 GTID position 一致 | 相同 |
+| **切換流量** | 更新 DB Cluster 中的 K8s Service selector（Ingress Gateway 路由到相同 Service 名稱，但 Service 現在指向 Green Pods） | 更新 ProxySQL server list / 調整 weight |
+| **恢復寫入** | Green 已經 `read_only=OFF` | ProxySQL: 以 Green 作為 write backend 恢復 |
+
+#### Ingress Gateway 關鍵注意事項
+
+| 注意事項 | 說明 |
+|---------|------|
+| DNS/Routing 快取 | Ingress Gateway 增加了額外的 DNS/Routing 層——需要了解其快取行為 |
+| 連線殘留 | 如果 Gateway 快取 backend 連線，這些 stale 連線必須被 drain |
+| Health Check 設定 | Gateway 的 Health Check 應該能快速偵測到 backend 變更 |
+| Connection Timeout | Gateway 上的 timeout 設定會影響 App 多快看到新的 backend |
+| 端到端延遲 | 跨叢集的 DNS/Routing 延遲意味著 App 感受到的 Switchover 可能有額外延遲 |
+
+> **重要**：短暫的寫入暫停是不可避免的（通常 1-5 秒）。AWS RDS Blue/Green 也是這樣做的。
+
+---
+
+### Decision 4：Switchover 期間的 Zone-B 處理
+
+此決策高度依賴 Decision 0 的選擇：
+
+#### 如果選 Option A（建立新 Green Cluster）
+
+```
+Before:   Zone-A-Blue-Primary ──async──► Zone-B-Primary
+After:    Zone-A-Green-Primary ──async──► Zone-B-Primary  (使用 CHANGE MASTER + GTID 重新指向)
+```
+
+Zone-B 在整個過程中維持 DR 角色。Switchover 後，只需把 Zone-B 重新指向 Green。
+
+#### 如果選 Option B（Zone-B 作為 Green）
+
+```
+Before:   Zone-A-Primary ──async──► Zone-B-Primary
+During:   Zone-A-Primary            Zone-B 升級中（DR 缺口！）
+After:    Zone-A (new DR) ◄──async── Zone-B-Primary（Apps 連到這裡）
+```
+
+Zone-A 變成新的 DR。Replication 方向反轉。
+
+---
+
+### Decision 5：交付格式
+
+| 選項 | 工作量 | 彈性 | 適合階段 |
+|------|--------|------|---------|
+| **Runbook + Scripts** | 低（週） | 手動、容易出錯 | **第一階段（推薦）** |
+| **Argo Workflows / Tekton Pipeline** | 中 | 半自動化、宣告式 | 第二階段 |
+| **擴展 mariadb-operator** | 中高 | 可貢獻上游，但受 operator roadmap 影響 | 長期 |
+| **自建 K8s Controller/CRD** | 高（月） | 完全自動化、自助式 | 長期 |
+
+> **建議**：先用 Runbook + Scripts 驗證流程，再逐步升級到 Pipeline 或 Controller。
+
+---
+
+## 4. Blue/Green 完整流程
+
+### 4.1 Option A 流程：建立新 Green Cluster
+
+```
+                        Phase 1                    Phase 2
+                    ┌──CREATE GREEN──┐         ┌──VALIDATE──┐
+                    │                │         │            │
+  ┌────────┐    ┌───▼───┐    ┌──────▼──┐   ┌──▼──────┐   ┌▼─────────┐
+  │Snapshot │───►│Create │───►│Restore  │──►│Setup    │──►│Run Smoke │
+  │Blue PVC │    │Green  │    │Data to  │   │GTID     │   │Tests on  │
+  │         │    │MariaDB│    │Green    │   │Repl.    │   │Green     │
+  └────────┘    │CR     │    │Primary  │   │Blue→Grn │   │          │
+                └───────┘    └─────────┘   └─────────┘   └──────────┘
+
+                        Phase 3                    Phase 4
+                    ┌──SWITCHOVER──┐           ┌──CLEANUP──┐
+                    │              │           │           │
+  ┌─────────┐   ┌──▼──────┐   ┌──▼──────┐   ┌▼─────────┐
+  │Set Blue  │──►│Wait for │──►│Switch   │──►│Re-point  │
+  │read_only │   │GTID Sync│   │K8s Svc  │   │Zone-B to    │
+  │= ON      │   │         │   │Selector │   │Green     │
+  └─────────┘   └─────────┘   │→ Green  │   └──────────┘
+                               └─────────┘
+```
+
+#### Phase 1：建立 Green 環境
+
+| 步驟 | 操作 | 備註 |
+|------|------|------|
+| 1 | Snapshot Blue Primary 的 PVC（或進行 Backup） | 優先使用 Volume Snapshot |
+| 2 | 建立新的 MariaDB CR（Green），使用目標版本/設定 | 需要新的 CR 名稱，可能需要新的 Namespace |
+| 3 | 將資料還原到 Green Primary | 從 Snapshot 或 Backup 還原 |
+| 4 | 設定 GTID Replication：Green Primary → 從 Blue Primary 複製 | `CHANGE MASTER TO MASTER_USE_GTID=slave_pos` |
+| 5 | 等待 Green 追上（`Seconds_Behind_Master = 0`） | 時間取決於資料量和寫入速度 |
+| 6 | Green 的 Semi-sync Replica 自動追上 | 由 operator 管理 |
+
+#### Phase 2：驗證 Green 環境
+
+| 步驟 | 操作 | 備註 |
+|------|------|------|
+| 7 | 對 Green 執行 Smoke Test（透過臨時 Service 或 port-forward） | 驗證基本連線和查詢 |
+| 8 | 驗證 Schema 相容性、Query Plan、App 連線能力 | 特別注意升級後的 SQL 行為變化 |
+| 9 | 租戶可選擇性地對 Green 進行測試 | 提供臨時連線方式 |
+
+#### Phase 3：Switchover
+
+| 步驟 | 操作 | 備註 |
+|------|------|------|
+| 10 | 公告維護窗口（即使是「零停機」） | 通知所有受影響的租戶 |
+| 11 | 在 Blue Primary 設定 `SET GLOBAL read_only=ON` 阻擋新寫入 | **寫入暫停開始** |
+| 12 | 等待 GTID 同步：Green 追上 Blue 最後的 GTID | 通常只需幾秒 |
+| 13 | 在 Green 停止 Replication（`STOP SLAVE`） | 切斷 Blue → Green 的連結 |
+| 14 | 確認 Green Primary `read_only=OFF` | 準備接受寫入 |
+| 15 | 更新 DB Cluster 中的 K8s Service selector → 指向 Green Pods | Ingress Gateway 路由到相同 Service 名稱——不需要修改 Gateway 設定 |
+| 16 | 驗證 App 透過 Ingress Gateway 的端到端連線 | **寫入暫停結束** |
+| 17 | 重新將 Zone-B 的 Replication 指向 Green Primary（`CHANGE MASTER`） | 恢復 DR 保護 |
+
+#### Phase 4：清理
+
+| 步驟 | 操作 | 備註 |
+|------|------|------|
+| 18 | 持續監控（保留 Blue 環境作為 Rollback 窗口） | 建議至少觀察 24-48 小時 |
+| 19 | 驗證期過後 → 刪除 Blue 環境 | 釋放資源 |
+| 20 | 更新 IaC 狀態（Helm values、ArgoCD 等） | 確保 GitOps 一致 |
+
+---
+
+### 4.2 Option B 流程：將 Zone-B 重新作為 Green
+
+```
+  ┌──────────────────────────────────────────────────────────┐
+  │  Phase 1: 升級 Zone-B                                       │
+  │                                                          │
+  │  Zone-A (Blue) 1P+2R ──async──► Zone-B 升級中 (DR 缺口!)       │
+  │  ▲ Apps                                                   │
+  └──────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+  ┌──────────────────────────────────────────────────────────┐
+  │  Phase 2: Replication 追趕                               │
+  │                                                          │
+  │  Zone-A (Blue) 1P+2R ──async──► Zone-B (Green) 1P+2R 追趕中   │
+  │  ▲ Apps                                                   │
+  └──────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+  ┌──────────────────────────────────────────────────────────┐
+  │  Phase 3: Switchover                                     │
+  │                                                          │
+  │  Zone-A (old Blue)            Zone-B (Green) 1P+2R             │
+  │                             ▲ Apps 透過 Ingress Gateway   │
+  └──────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+  ┌──────────────────────────────────────────────────────────┐
+  │  Phase 4: 重建 DR                                        │
+  │                                                          │
+  │  Zone-A (new DR) 1P+2R ◄──async── Zone-B (Primary) 1P+2R      │
+  │                                  ▲ Apps                   │
+  └──────────────────────────────────────────────────────────┘
+```
+
+#### Phase 1：升級 Zone-B
+
+| 步驟 | 操作 | 備註 |
+|------|------|------|
+| 1 | 停止 Zone-A → Zone-B 的 Replication | **DR 缺口開始** |
+| 2 | 就地升級 Zone-B 或重建 Zone-B（使用目標版本） | 取決於升級路徑是否支援就地升級 |
+| 3 | 確認 Zone-B 升級成功，服務正常 | 驗證版本號、基本查詢 |
+
+#### Phase 2：Replication 追趕
+
+| 步驟 | 操作 | 備註 |
+|------|------|------|
+| 4 | 重新建立 Zone-A → Zone-B 的 GTID Replication | GTID 允許從中斷處繼續同步 |
+| 5 | 等待 Zone-B 追上（`Seconds_Behind_Master = 0`） | 時間取決於升級期間的寫入量 |
+| 6 | 對 Zone-B（Green）執行 Smoke Test | 透過臨時 Service 或 port-forward |
+
+#### Phase 3：Switchover
+
+| 步驟 | 操作 | 備註 |
+|------|------|------|
+| 7 | 公告維護窗口 | 通知所有受影響的租戶 |
+| 8 | 在 Zone-A Blue Primary 設定 `read_only=ON` | **寫入暫停開始** |
+| 9 | 等待 GTID 同步 | 確認 Zone-B 已追上 |
+| 10 | 在 Zone-B 停止 Replication（`STOP SLAVE`） | 切斷 Zone-A → Zone-B 的連結 |
+| 11 | 確認 Zone-B Primary `read_only=OFF` | 準備接受寫入 |
+| 12 | 更新 Ingress Gateway / K8s Service 路由 → 指向 Zone-B | **注意**：此時 Primary 搬到了不同的 Zone |
+| 13 | 驗證 App 端到端連線 | **寫入暫停結束** |
+
+#### Phase 4：重建 DR
+
+| 步驟 | 操作 | 備註 |
+|------|------|------|
+| 14 | 重建 Zone-A 作為新的 DR（可能需要全新 Restore） | Replication 方向反轉 |
+| 15 | 建立 Zone-B → Zone-A 的 GTID Replication | Zone-A 現在是 DR |
+| 16 | 等待 Zone-A 追上 | **DR 缺口結束** |
+| 17 | 刪除舊的 Zone-A 環境、更新 IaC 狀態 | 確保 GitOps 一致 |
+
+---
+
+## 5. 風險與緩解策略
+
+### 技術風險
+
+| 風險 | 影響 | 緩解策略 |
+|------|------|---------|
+| **mariadb-operator 不原生支援跨 CR Replication** | 無法單靠 operator CRD 建立 Blue→Green Replication | 需要手動執行 `CHANGE MASTER` 或擴展 operator |
+| **Storage 不支援 Volume Snapshot** | Green 建立需退回到較慢的 Backup/Restore | 事先確認 CSI Driver 能力 |
+| **Semi-sync Replication 在 Switchover 期間中斷** | 短暫的資料不一致可能性 | `read_only` + GTID 同步步驟可防止此問題 |
+| **Ingress Gateway 連線快取** | Gateway 可能在 Service selector 變更後仍持有指向舊 Blue Pods 的持久連線 | 確認 Gateway 的 connection drain 行為、health check interval、idle timeout 設定 |
+| **跨叢集 DNS/Routing 延遲** | App 在不同叢集中透過 Gateway 感受到的 Switchover 有額外延遲 | 測試端到端 Switchover 延遲（包含 Gateway 傳播時間） |
+
+### 營運風險
+
+| 風險 | 影響 | 緩解策略 |
+|------|------|---------|
+| **Zone-B Replication 缺口（Switchover 期間）** | DR 能力暫時降低 | 縮短 Switchover 窗口，密切監控 Zone-B Lag |
+| **多租戶協調** | 共享實例上的所有 App 同時受影響 | 溝通維護窗口，驗證所有租戶的 retry 邏輯 |
+| **資源壓力** | 同時運行 Blue + Green 會加倍資源使用 | 確認 Cluster 有足夠餘量，或使用 Cluster Autoscaler |
+| **Rollback 失敗** | 如果 Green 有問題但 Blue 已被清除，無法回退 | 保留 Blue 至少 24-48 小時的驗證期 |
+
+### 與 AWS RDS Blue/Green 的風險對比
+
+| 風險項目 | AWS RDS 如何處理 | 自建環境需要自行處理 |
+|---------|-----------------|-----------------|
+| Green 環境建立 | AWS 自動從 Snapshot 建立 | 需自行管理 PVC Snapshot 或 Backup/Restore |
+| Replication 設定 | AWS 自動配置 binlog replication | 需手動或腳本執行 `CHANGE MASTER` |
+| Switchover 原子性 | AWS 使用 DNS CNAME flip（通常 < 1 分鐘） | 需自行管理 K8s Service selector + Ingress Gateway |
+| Rollback | AWS 支援 Switchover 失敗自動回退 | 需自行設計 Rollback 流程 |
+| 監控 | CloudWatch 整合 | 需自行設定 Prometheus + Grafana Dashboard |
+
+---
+
+## 6. 建議的下一步行動
+
+```
+Step 1: 盤點審計
+  ├── 確認 Storage Class 是否支援 Snapshot
+  ├── 確認 mariadb-operator 版本與可用功能
+  ├── 確認所有實例的 GTID 設定
+  └── 收集 Section 2 的所有資訊
+
+Step 2: 團隊討論
+  ├── 使用此文件對齊 Decision 0（New Green vs Zone-B-as-Green）
+  ├── 確定其他關鍵決策（Decision 1-5）
+  └── 定義 Rollback 標準和 Switchover SLA
+
+Step 3: 選擇一個 Pilot 實例
+  ├── 選擇低風險、小型的 DB 實例
+  ├── 確認該實例的所有租戶已知悉
+  └── 準備測試環境
+
+Step 4: 手動原型驗證
+  ├── 在 Pilot 實例上手動走一遍 Phase 1-4
+  ├── 記錄每個階段的時間
+  │    ├── Snapshot 時間
+  │    ├── Replication 追趕時間
+  │    ├── Switchover 持續時間（寫入暫停時長）
+  │    └── Zone-B 重新指向時間
+  └── 記錄遇到的問題和解決方案
+
+Step 5: 文件化
+  ├── 將原型轉為可重複執行的 Runbook
+  ├── 建立 Pre-flight Checklist
+  └── 建立 Rollback Playbook
+
+Step 6: 自動化
+  ├── 基於 Runbook 建立 Script
+  ├── 逐步升級到 Argo Workflows / Tekton Pipeline
+  └── 長期考慮擴展 operator 或建立自訂 Controller
+```
+
+---
+
+## 附錄 A：Switchover 期間的連線流程圖
+
+```
+  時間軸
+  ──────────────────────────────────────────────────────────────►
+
+  ┌────────────┐  ┌──────┐  ┌────────────────┐  ┌────────────┐
+  │  正常運作   │  │ 暫停  │  │  切換 + 驗證    │  │  恢復運作   │
+  │  Blue 服務  │  │ 寫入  │  │  Green 接手     │  │  Green 服務 │
+  └────────────┘  └──────┘  └────────────────┘  └────────────┘
+                  ◄─ 1~5s ─►
+
+  App 視角：
+  ─── 正常讀寫 ──── 寫入失敗/等待 ──── 正常讀寫（連到 Green）───►
+                    (read OK)
+
+  DB 視角：
+  ─── Blue read_only=ON ─── GTID sync ─── Service selector 切換 ───►
+```
+
+## 附錄 B：關鍵 SQL 指令參考
+
+### 設定 GTID Replication（Green 從 Blue 複製）
+
+```sql
+-- 在 Green Primary 上執行
+CHANGE MASTER TO
+  MASTER_HOST='<blue-primary-host>',
+  MASTER_PORT=3306,
+  MASTER_USER='repl_user',
+  MASTER_PASSWORD='<password>',
+  MASTER_USE_GTID=slave_pos;
+
+START SLAVE;
+```
+
+### 檢查 Replication 狀態
+
+```sql
+-- 在 Green Primary 上執行
+SHOW SLAVE STATUS\G
+
+-- 關鍵欄位：
+--   Seconds_Behind_Master: 0        ← 已追上
+--   Gtid_Slave_Pos: <GTID>         ← 與 Blue 的 Gtid_Current_Pos 比對
+--   Slave_IO_Running: Yes
+--   Slave_SQL_Running: Yes
+```
+
+### Switchover 指令序列
+
+```sql
+-- Step 1: 在 Blue Primary 阻擋寫入
+SET GLOBAL read_only=ON;
+
+-- Step 2: 確認 Green 已追上（在 Green 上檢查）
+SHOW SLAVE STATUS\G
+-- 確認 Seconds_Behind_Master = 0
+
+-- Step 3: 在 Green 停止 Replication
+STOP SLAVE;
+RESET SLAVE ALL;    -- 清除 Replication 設定
+
+-- Step 4: 確認 Green 可寫入
+SET GLOBAL read_only=OFF;
+
+-- Step 5: 切換 K8s Service selector（kubectl 操作，非 SQL）
+
+-- Step 6: 重新將 Zone-B 指向 Green
+-- 在 Zone-B Primary 上執行
+STOP SLAVE;
+CHANGE MASTER TO
+  MASTER_HOST='<green-primary-host>',
+  MASTER_PORT=3306,
+  MASTER_USER='repl_user',
+  MASTER_PASSWORD='<password>',
+  MASTER_USE_GTID=slave_pos;
+
+START SLAVE;
+```
+
+### 確認 GTID 設定
+
+```sql
+-- 確認 GTID 嚴格模式已開啟
+SHOW GLOBAL VARIABLES LIKE 'gtid_strict_mode';
+-- 應為 ON
+
+-- 查看目前 GTID Position
+SELECT @@gtid_current_pos;
+SELECT @@gtid_slave_pos;
+```
