@@ -238,16 +238,7 @@ Snapshot Blue → Restore 為 Green → 自動建立 binlog Replication → 測�
 | 4 | **整個 Blue/Green 流程用什麼驅動？** | Runbook + Shell Script → Makefile/Taskfile → Argo Workflows / Tekton → 自訂 K8s Controller | Runbook + Shell Script |
 | 5 | **Green 環境如何監控？** | Script 輪詢（`SHOW SLAVE STATUS`）→ Prometheus + mysqld_exporter → 完整 Grafana Dashboard | 已有 Prometheus 則直接使用，否則 Script 輪詢 |
 
-**建議演進路線**
-
-| 階段 | CR 生成 | PVC 資料 | Replication 管理 | 流程驅動 | 監控 |
-|------|---------|---------|-----------------|---------|------|
-| **Phase 1：手動驗證** | 手動複製 YAML | Backup + Restore | Shell Script | Runbook + Script | Script 輪詢 |
-| **Phase 2：腳本化** | Shell Script | Volume Snapshot（如支援） | K8s Job | Makefile/Taskfile | Prometheus Stack |
-| **Phase 3：自動化** | Kustomize 或 Helm | Volume Snapshot | K8s Job | Argo Workflows | Prometheus + Grafana |
-| **Phase 4：平台化** | Helm + ArgoCD | Volume Snapshot | 自訂 CRD | 自訂 Controller | 完整 Observability |
-
-> 每個問題可以獨立演進——不需要所有問題同時進入下一階段。例如可以先把監控升級到 Prometheus，而流程驅動還停留在 Runbook。
+> 上述問題的建議演進路線見 [Section 6：建議的下一步行動](#6-建議的下一步行動)。
 
 ---
 
@@ -395,6 +386,8 @@ Zone-A 變成新的 DR。Replication 方向反轉。
 | **自建 K8s Controller/CRD** | 高（月） | 完全自動化、自助式 | 長期 |
 
 > **建議**：先用 Runbook + Scripts 驗證流程，再逐步升級到 Pipeline 或 Controller。
+
+> **補充**：此 Decision 涵蓋 [Decision 0 自動化缺口分析](#與-aws-rds-blugreen-的對照)中「流程驅動」的面向。完整的多維度自動化演進（包含 CR 生成、Replication 管理、監控等）見 [Section 6](#6-建議的下一步行動)。
 
 ---
 
@@ -575,6 +568,12 @@ Zone-A 變成新的 DR。Replication 方向反轉。
 
 ## 6. 建議的下一步行動
 
+本節整合 [Decision 0 的自動化缺口分析](#自建環境需要回答的問題清單)與實作步驟，分為兩大部分：Phase 0（實作前準備）和 Phase 1-4（自動化演進路線）。
+
+### Phase 0：實作前準備
+
+在進入自動化演進之前，先完成以下準備工作：
+
 ```
 Step 1: 盤點審計
   ├── 確認 Storage Class 是否支援 Snapshot
@@ -591,26 +590,40 @@ Step 3: 選擇一個 Pilot 實例
   ├── 選擇低風險、小型的 DB 實例
   ├── 確認該實例的所有租戶已知悉
   └── 準備測試環境
+```
 
-Step 4: 手動原型驗證
-  ├── 在 Pilot 實例上手動走一遍 Phase 1-4
+### Phase 1-4：自動化演進路線
+
+以下表格對應 [Decision 0 問題清單](#自建環境需要回答的問題清單)的 5 個維度，定義每個階段的目標狀態。每個維度可以獨立演進——不需要所有維度同時進入下一階段。
+
+| 階段 | CR 生成（問題 1） | PVC 資料（問題 2） | Replication 管理（問題 3） | 流程驅動（問題 4） | 監控（問題 5） |
+|------|-----------------|------------------|------------------------|-----------------|-------------|
+| **Phase 1：手動驗證** | 手動複製 YAML | Backup + Restore | Shell Script | Runbook + Script | Script 輪詢 |
+| **Phase 2：腳本化** | Shell Script | Volume Snapshot（如支援） | K8s Job | Makefile/Taskfile | Prometheus Stack |
+| **Phase 3：自動化** | Kustomize 或 Helm | Volume Snapshot | K8s Job | Argo Workflows | Prometheus + Grafana |
+| **Phase 4：平台化** | Helm + ArgoCD | Volume Snapshot | 自訂 CRD | 自訂 Controller | 完整 Observability |
+
+> **流程驅動**維度的詳細選項比較見 [Decision 5](#decision-5交付格式)。
+
+#### Phase 1 重點：Pilot 手動驗證
+
+Phase 1 使用 Phase 0 選定的 Pilot 實例，手動走一遍完整流程：
+
+```
+Pilot 驗證
+  ├── 在 Pilot 實例上手動走一遍 Section 4 的 Phase 1-4 流程
   ├── 記錄每個階段的時間
   │    ├── Snapshot 時間
   │    ├── Replication 追趕時間
   │    ├── Switchover 持續時間（寫入暫停時長）
   │    └── Zone-B 重新指向時間
-  └── 記錄遇到的問題和解決方案
-
-Step 5: 文件化
-  ├── 將原型轉為可重複執行的 Runbook
-  ├── 建立 Pre-flight Checklist
-  └── 建立 Rollback Playbook
-
-Step 6: 自動化
-  ├── 基於 Runbook 建立 Script
-  ├── 逐步升級到 Argo Workflows / Tekton Pipeline
-  └── 長期考慮擴展 operator 或建立自訂 Controller
+  ├── 記錄遇到的問題和解決方案
+  └── 將原型轉為可重複執行的 Runbook
+      ├── 建立 Pre-flight Checklist
+      └── 建立 Rollback Playbook
 ```
+
+> 完成 Phase 1 後，依據實際需求選擇各維度的下一步演進方向。
 
 ---
 
