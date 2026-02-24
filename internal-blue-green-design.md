@@ -230,24 +230,67 @@ Option B: 扇出式（Fan-out）
 
 ### Decision 3：Switchover 機制
 
-由於 App 透過 **Ingress Gateway**（跨叢集）連線，Switchover 有更多層次：
+App 與 DB 在不同的 K8s Cluster，連線路徑經過多個層次。理解這些分層是設計 Switchover 的前提。
+
+#### A. 連線路徑分層
 
 ```
-App Cluster → Ingress Gateway → [ K8s Service (DB Cluster) ] → MariaDB Pods
-                                  ^^^^^^^^^^^^^^^^^^^^^^^^^
-                                  流量在這裡切換
+┌─ Layer 1：跨叢集（固定不變）───────────────────────────────────────────┐
+│                                                                      │
+│   App Cluster ──────► Ingress Gateway ──────► DB K8s Cluster         │
+│                                                                      │
+│   · Ingress Gateway 是跨叢集的固定入口，兩種方案都必經                     │
+│   · Option A（同 Zone 切換）：Layer 1 不需要修改                         │
+│   · Option B（跨 Zone 切換）：Layer 1 的 Gateway 路由目標需要更新          │
+│                                                                      │
+└──────────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─ Layer 2：DB Cluster 內部（Switchover 的決策點）─────────────────────────┐
+│                                                                      │
+│   方案 A（K8s Service selector）：                                     │
+│     Ingress GW → K8s Service ──selector──► MariaDB Pods              │
+│     切換方式：更新 Service 的 selector 指向 Green Pods                   │
+│                                                                      │
+│   方案 B（ProxySQL）：                                                 │
+│     Ingress GW → K8s Service → ProxySQL → MariaDB Pods               │
+│     切換方式：更新 ProxySQL 的 server list / weight                     │
+│                                                                      │
+└──────────────────────────────────────────────────────────────────────┘
 ```
 
-#### Switchover 步驟
+> **關鍵觀念**：Ingress Gateway 與 ProxySQL **不是**二擇一的關係。Gateway 是 Layer 1 的固定入口，永遠在路徑上。真正的決策點在 Layer 2——DB Cluster 內部用什麼機制切換流量。
 
-| 階段 | 使用 Ingress Gateway（現在） | 使用 ProxySQL（未來） |
-|------|---------------------------|----------------------|
-| **暫停寫入** | Blue Primary 設定 `SET GLOBAL read_only=ON` | ProxySQL: 暫停 write backend |
-| **等待同步** | 檢查 GTID position 一致 | 相同 |
-| **切換流量** | 更新 DB Cluster 中的 K8s Service selector（Ingress Gateway 路由到相同 Service 名稱，但 Service 現在指向 Green Pods） | 更新 ProxySQL server list / 調整 weight |
-| **恢復寫入** | Green 已經 `read_only=OFF` | ProxySQL: 以 Green 作為 write backend 恢復 |
+#### B. Switchover 共用步驟（DB-level，與 Layer 2 流量切換方式無關）
 
-#### Ingress Gateway 關鍵注意事項
+無論 Layer 2 使用哪種方案，以下 DB 層操作都相同：
+
+| 順序 | 操作 | 說明 |
+|------|------|------|
+| 1 | Blue: `SET GLOBAL read_only=ON` | 阻擋新寫入，**寫入暫停開始** |
+| 2 | 等待 GTID sync | 確認 Green 已追上 Blue 最後的 GTID |
+| 3 | Green: `STOP SLAVE; RESET SLAVE ALL;` | 切斷 Blue → Green 的 Replication |
+| 4 | Green: `read_only=OFF` | Green 準備接受寫入 |
+| 5 | **切換流量** | ← Layer 2 方案決定如何執行，見下方 Decision 表格 |
+| 6 | 驗證端到端連線 | 確認 App 透過 Ingress Gateway → Green 正常讀寫，**寫入暫停結束** |
+
+> **重要**：短暫的寫入暫停是不可避免的（通常 1-5 秒）。AWS RDS Blue/Green 也是這樣做的。
+
+#### C. Decision 表格：Layer 2 流量切換方式
+
+| 比較維度 | 方案 A：K8s Service selector | 方案 B：ProxySQL |
+|---------|---------------------------|-----------------|
+| **切換動作** | `kubectl patch svc` 更新 selector | 更新 ProxySQL server list / 調整 weight |
+| **切換粒度** | 全量切換（All-or-Nothing） | 可漸進式切換（調整 weight 逐步移轉流量） |
+| **額外元件** | 無——使用 K8s 原生機制 | 需要部署和維護 ProxySQL |
+| **讀寫分離** | 不支援（需額外 Service） | 原生支援（ProxySQL hostgroup） |
+| **切換速度** | 快（K8s Service 更新幾乎即時） | 快（ProxySQL runtime 動態更新） |
+| **回滾方式** | 反向 patch selector 回 Blue Pods | 反向更新 server list 回 Blue |
+| **適合階段** | **現階段（推薦）**——簡單、無額外依賴 | 未來——當需要讀寫分離或漸進式切換時引入 |
+
+#### D. Ingress Gateway 注意事項（兩種 Layer 2 方案都適用）
+
+無論 Layer 2 使用 K8s Service selector 或 ProxySQL，流量都經過 Ingress Gateway，因此以下注意事項**同時適用於兩種方案**：
 
 | 注意事項 | 說明 |
 |---------|------|
@@ -256,8 +299,6 @@ App Cluster → Ingress Gateway → [ K8s Service (DB Cluster) ] → MariaDB Pod
 | Health Check 設定 | Gateway 的 Health Check 應該能快速偵測到 backend 變更 |
 | Connection Timeout | Gateway 上的 timeout 設定會影響 App 多快看到新的 backend |
 | 端到端延遲 | 跨叢集的 DNS/Routing 延遲意味著 App 感受到的 Switchover 可能有額外延遲 |
-
-> **重要**：短暫的寫入暫停是不可避免的（通常 1-5 秒）。AWS RDS Blue/Green 也是這樣做的。
 
 ---
 
@@ -353,7 +394,7 @@ Zone-A 變成新的 DR。Replication 方向反轉。
 | 12 | 等待 GTID 同步：Green 追上 Blue 最後的 GTID | 通常只需幾秒 |
 | 13 | 在 Green 停止 Replication（`STOP SLAVE`） | 切斷 Blue → Green 的連結 |
 | 14 | 確認 Green Primary `read_only=OFF` | 準備接受寫入 |
-| 15 | 更新 DB Cluster 中的 K8s Service selector → 指向 Green Pods | Ingress Gateway 路由到相同 Service 名稱——不需要修改 Gateway 設定 |
+| 15 | **Layer 2 切換**：更新 DB Cluster 中的 K8s Service selector → 指向 Green Pods | Layer 1（Ingress Gateway）不需要修改——Gateway 路由到相同 Service 名稱，只有 Layer 2（Service selector）變動 |
 | 16 | 驗證 App 透過 Ingress Gateway 的端到端連線 | **寫入暫停結束** |
 | 17 | 重新將 Zone-B 的 Replication 指向 Green Primary（`CHANGE MASTER`） | 恢復 DR 保護 |
 
@@ -427,7 +468,7 @@ Zone-A 變成新的 DR。Replication 方向反轉。
 | 9 | 等待 GTID 同步 | 確認 Zone-B 已追上 |
 | 10 | 在 Zone-B 停止 Replication（`STOP SLAVE`） | 切斷 Zone-A → Zone-B 的連結 |
 | 11 | 確認 Zone-B Primary `read_only=OFF` | 準備接受寫入 |
-| 12 | 更新 Ingress Gateway / K8s Service 路由 → 指向 Zone-B | **注意**：此時 Primary 搬到了不同的 Zone |
+| 12 | **Layer 1 + Layer 2 都需要切換**：更新 Ingress Gateway 路由目標 → Zone-B（Layer 1），更新 K8s Service → 指向 Zone-B Green Pods（Layer 2） | 與 Option A 不同——Option A 同 Zone 切換只需變動 Layer 2；Option B 因為 Primary 跨 Zone 搬遷，**兩層都需要修改** |
 | 13 | 驗證 App 端到端連線 | **寫入暫停結束** |
 
 #### Phase 4：重建 DR
