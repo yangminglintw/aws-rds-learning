@@ -2,11 +2,31 @@
 
 這篇筆記整理了 AWS RDS Blue/Green Deployments 的完整內容，包含官方文檔中的所有重要主題。
 
+## Article Overview
+
+| # | Section | Summary |
+|---|---------|---------|
+| 1 | [Introduction](#1-introduction) | Blue/Green 概念、優點與常見問題 |
+| 2 | [Supported Engines & Versions](#2-supported-engines--versions) | MySQL、MariaDB、PostgreSQL 支援版本一覽 |
+| 3 | [How It Works](#3-how-it-works) | Topology 複製、命名規則、Replication 機制 |
+| 4 | [PostgreSQL Replication Methods](#4-postgresql-replication-methods) | Physical vs Logical Replication 差異與限制 |
+| 5 | [Creating a Blue/Green Deployment](#5-creating-a-bluegreen-deployment) | 前置條件、可設定參數、Lazy Loading |
+| 6 | [Switchover Process](#6-switchover-process) | Guardrails、切換步驟、DNS TTL、監控 |
+| 7 | [Deleting a Blue/Green Deployment](#7-deleting-a-bluegreen-deployment) | 刪除時機與保留/刪除 Green 選項 |
+| 8 | [Limitations & Considerations](#8-limitations--considerations) | 一般限制、引擎特定限制、Post-Switchover 更新清單 |
+| 9 | [Best Practices](#9-best-practices) | Switchover 前檢查清單、MySQL/PostgreSQL 最佳化 |
+| 10 | [IAM Authorization](#10-iam-authorization) | 建立、Switchover、刪除所需 IAM 權限 |
+| 11 | [Cost Considerations](#11-cost-considerations) | 費用項目與最佳化建議 |
+| 12 | [References](#12-references) | 官方文檔完整連結 |
+| A | [Appendix A: RDS Internal Account Architecture](#appendix-a-rds-internal-account-architecture) | rdsadmin 帳號與權限層級 |
+
 ---
 
-## 1. 簡介
+## 1. Introduction
 
-### 什麼是 Blue/Green Deployment？
+> 📖 **Source**: [Blue/Green Deployments Overview](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/blue-green-deployments-overview.html)
+
+### What is Blue/Green Deployment?
 
 Blue/Green Deployment 是一種部署策略，建立一個與 Production 完全相同的 Staging 環境，在 Staging 完成變更與測試後，再將流量切換過去。
 
@@ -15,7 +35,7 @@ Blue/Green Deployment 是一種部署策略，建立一個與 Production 完全�
 | **Blue** | 目前的 Production 環境 |
 | **Green** | 同步的 Staging 副本 |
 
-### 主要優點
+### Key Benefits
 
 傳統資料庫升級的問題：
 - 停機時間長（30 分鐘到數小時）
@@ -28,7 +48,7 @@ Blue/Green 的優點：
 - 出問題可以快速切回 Blue
 - 減少升級風險
 
-### 常見問題
+### FAQ
 
 **Q: Switchover 後需要更改 Connection String 嗎？**
 
@@ -40,7 +60,7 @@ Blue/Green 的優點：
 > "The names and endpoints in the current production environment are assigned to the newly switched over production environment, requiring no changes to your application."
 > — [Blue/Green Deployments Overview](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/blue-green-deployments-overview.html)
 
-> ⚠️ **但 DNS cache 是隱患！** "Make sure that your network and client configurations don't increase the DNS cache Time-To-Live (TTL) beyond five seconds..." 確保所有層級的 DNS cache TTL ≤ 5 秒，否則切換後可能仍連到舊 IP。詳見[第 6 節：Endpoint 重新命名與 DNS](#endpoint-重新命名與-dns)。
+> ⚠️ **但 DNS cache 是隱患！** "Make sure that your network and client configurations don't increase the DNS cache Time-To-Live (TTL) beyond five seconds..." 確保所有層級的 DNS cache TTL ≤ 5 秒，否則切換後可能仍連到舊 IP。詳見[第 6 節：Endpoint Renaming and DNS](#endpoint-renaming-and-dns)。
 
 **Q: 如何提前在 Green 環境測試？**
 
@@ -52,15 +72,15 @@ Green 環境建立後會有**獨立的臨時 endpoint**（格式為 `{instance-i
 > ⚠️ **測試時建議保持 Green 為唯讀：** "During testing, we recommend that you keep your databases in the green environment read only. Enable write operations on the green environment with caution because they can result in replication conflicts."
 > — [Blue/Green Deployments Best Practices](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/blue-green-deployments-best-practices.html)
 
-> ⚠️ **測試前記得做 Storage Initialization（預熱）：** "After you create the blue/green deployment, handle lazy loading if necessary. Make sure data loading is complete before switching over." 因為 Green 是從 Snapshot Restore 建立的，使用 Lazy Loading，首次存取的 block 才會從 S3 載入，會導致初期查詢延遲較高。詳見[第 5 節：Lazy Loading](#lazy-loading--storage-initialization)。
-
-> **來源**: [Blue/Green Deployments Overview](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/blue-green-deployments-overview.html)
+> ⚠️ **測試前記得做 Storage Initialization（預熱）：** Green 是從 Snapshot Restore 建立的，使用 Lazy Loading，首次存取的 block 才會從 S3 載入，會導致初期查詢延遲較高。詳見[第 5 節：Lazy Loading](#lazy-loading--storage-initialization)。
 
 ---
 
-## 2. 支援的資料庫引擎與版本
+## 2. Supported Engines & Versions
 
-### 支援狀況總覽
+> 📖 **Source**: [Supported Regions and Engines](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/Concepts.RDS_Fea_Regions_DB-eng.Feature.BlueGreenDeployments.html)
+
+### Support Overview
 
 | 引擎 | 支援狀態 | 支援版本 |
 |------|---------|---------|
@@ -71,7 +91,7 @@ Green 環境建立後會有**獨立的臨時 endpoint**（格式為 `{instance-i
 | RDS for Oracle | ❌ | 不支援 |
 | RDS for SQL Server | ❌ | 不支援 |
 
-### 版本詳細說明
+### Version Details
 
 #### MySQL
 - 5.7.44 及更新版本
@@ -93,13 +113,13 @@ Green 環境建立後會有**獨立的臨時 endpoint**（格式為 `{instance-i
 - 15.4 及更新版本
 - 16 及更新版本
 
-> **來源**: [Blue/Green Deployments Supported Regions and Engines](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/Concepts.RDS_Fea_Regions_DB-eng.Feature.BlueGreenDeployments.html)
-
 ---
 
-## 3. 運作原理
+## 3. How It Works
 
-### Topology 複製
+> 📖 **Source**: [Blue/Green Deployments Overview](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/blue-green-deployments-overview.html)
+
+### Topology Replication
 
 建立 Blue/Green Deployment 時，AWS 會複製整個 Topology，包含以下項目：
 
@@ -113,9 +133,9 @@ Green 環境建立後會有**獨立的臨時 endpoint**（格式為 `{instance-i
 | **Performance Insights** | 效能監控設定 |
 | **Enhanced Monitoring** | 進階監控設定 |
 
-#### 三種 Topology 情境
+#### Three Topology Scenarios
 
-**情境一：Standalone（只有 Primary）**
+**Scenario 1: Standalone (Primary Only)**
 
 ```
 Blue                           Green
@@ -126,7 +146,7 @@ Blue                           Green
 └─────────────────┘            └─────────────────┘
 ```
 
-**情境二：Primary + Read Replicas**
+**Scenario 2: Primary + Read Replicas**
 
 ```
 Blue                           Green
@@ -143,7 +163,7 @@ Blue                           Green
                                └─────────────────┘
 ```
 
-**情境三：Multi-AZ + Read Replicas（含 Standby）**
+**Scenario 3: Multi-AZ + Read Replicas (with Standby)**
 
 ```
 Blue                           Green
@@ -167,7 +187,7 @@ Blue                           Green
                                └─────────────────┘
 ```
 
-#### 命名規則
+#### Naming Convention
 
 建立時，Green 環境的 DB Identifier 加上 `-green-<隨機字串>` 後綴。
 
@@ -182,7 +202,7 @@ Switchover 後重新命名（**整個 Topology 一起換**）：
 
 > **重點**：不只 Primary 的 endpoint 換了，**Replica 的 endpoint 也一起換了**。應用程式如果有直連 Read Replica endpoint，也會自動切到新的 Green Replica。
 
-#### Read Replica 特殊規則
+#### Read Replica Special Rules
 
 **Storage 處理**：
 - Green 所有 Replica 的 **allocated storage** 會統一成 **Green Primary 的大小**
@@ -203,13 +223,13 @@ aws rds modify-db-instance \
 
 > **坑**：如果忘了手動改，Switchover 後會出現大台 Primary 配小台 Replica 的情況。
 
-#### Single-AZ 轉 Multi-AZ
+#### Single-AZ to Multi-AZ
 
 - 建立 Blue/Green 時，可以將 Blue（Single-AZ）升級為 Green（Multi-AZ）
 - Storage initialization 會包含 **Standby node**，預熱資料時要考慮 Standby 也需要初始化
 - 這是測試 Multi-AZ 架構的好時機
 
-#### 建立本質
+#### Creation Process
 
 Green 環境的建立流程：**Snapshot → Restore → Replication**
 
@@ -219,7 +239,7 @@ Green 環境的建立流程：**Snapshot → Restore → Replication**
 
 > **影響**：因為是從 Snapshot Restore，Green 使用 **Lazy Loading**（首次存取的 block 才會從 S3 載入）。這會導致初期查詢延遲較高，詳見[第 5 節：Lazy Loading](#lazy-loading--storage-initialization)。
 
-### Replication 機制
+### Replication Mechanism
 
 #### MySQL / MariaDB
 
@@ -237,11 +257,11 @@ Green 環境的建立流程：**Snapshot → Restore → Replication**
 | **Physical Replication** | Minor 版本升級、相同版本 | Green 為唯讀，使用 WAL |
 | **Logical Replication** | Major 版本升級 | Green 可讀寫，限制較多 |
 
-> **來源**: [Blue/Green Deployments Overview](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/blue-green-deployments-overview.html)
-
 ---
 
-## 4. PostgreSQL 複製方法
+## 4. PostgreSQL Replication Methods
+
+> 📖 **Source**: [Replication Type](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/blue-green-deployments-replication-type.html)
 
 ### Physical Replication vs Logical Replication
 
@@ -253,7 +273,7 @@ Green 環境的建立流程：**Snapshot → Restore → Replication**
 | **限制** | 較少 | 較多（見下方詳述）|
 | **效能影響** | 較小 | 較大 |
 
-### 版本對照表
+### Version Mapping
 
 AWS 會根據 Blue/Green 環境的版本組合自動決定使用哪種複製方法：
 
@@ -268,13 +288,13 @@ AWS 會根據 Blue/Green 環境的版本組合自動決定使用哪種複製方�
 - 相同 Major 版本 → Physical Replication
 - 不同 Major 版本 → Logical Replication
 
-### Physical Replication 限制
+### Physical Replication Limitations
 
 - Green 環境為 **唯讀**
 - 不支援變更 DB Parameter Group（除了少數參數）
 - 不能在 Green 環境安裝新的 Extensions
 
-### Logical Replication 限制
+### Logical Replication Limitations
 
 這是做 Major 版本升級時要特別注意的：
 
@@ -289,22 +309,24 @@ AWS 會根據 Blue/Green 環境的版本組合自動決定使用哪種複製方�
 
 > **我的理解**：Logical Replication 的原理是複製「SQL 語句的結果」而不是「底層的資料變更」，所以有些操作無法正確複製。
 
-> **來源**: [Blue/Green Deployments Replication Type](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/blue-green-deployments-replication-type.html)
-
 ---
 
-## 5. 建立 Blue/Green Deployment
+## 5. Creating a Blue/Green Deployment
 
-### 前置條件
+> 📖 **Source**: [Creating a Blue/Green Deployment](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/blue-green-deployments-creating.html)
 
-#### 所有引擎通用
+### Prerequisites
+
+#### All Engines
+
 - 必須啟用自動備份（Backup Retention Period > 0）
 - Blue 環境必須處於 `available` 狀態
 - 不能有進行中的 Maintenance Window
 - 不能使用 RDS Proxy
 - **不支援使用 Secrets Manager 自動管理 Master Password**（這是常見的坑，因為很多人使用此功能）
 
-#### MySQL / MariaDB 特定
+#### MySQL / MariaDB
+
 - 必須啟用 Binary Logging
 - `binlog_format` 必須設為 `ROW`
 - 如果有 Read Replica，必須使用 GTID-based replication
@@ -328,12 +350,13 @@ AWS 會根據 Blue/Green 環境的版本組合自動決定使用哪種複製方�
   1. 先建立 Blue/Green Deployment（不升級版本）
   2. Green 建好後，再在 Green 環境裡做版本升級
 
-#### PostgreSQL 特定
+#### PostgreSQL
+
 - 對於 Logical Replication，需要 `rds.logical_replication` = `1`
 - 建議設定足夠的 `max_replication_slots`
 - 建議設定足夠的 `max_wal_senders`
 
-### 可設定的參數
+### Configurable Parameters
 
 建立 Blue/Green Deployment 時，可以為 Green 環境設定：
 
@@ -356,7 +379,7 @@ AWS 會根據 Blue/Green 環境的版本組合自動決定使用哪種複製方�
 - 建立 Green 後，執行完整的資料掃描來「預熱」資料
 - 可以使用 `SELECT * FROM table` 或 `pg_prewarm` extension
 
-### 建立方式
+### Creation Methods
 
 #### Console
 1. 選擇要建立 Blue/Green Deployment 的 DB Instance
@@ -373,15 +396,15 @@ aws rds create-blue-green-deployment \
     --target-db-parameter-group-name my-new-param-group
 ```
 
-> **來源**: [Creating a Blue/Green Deployment](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/blue-green-deployments-creating.html)
-
 ---
 
-## 6. Switchover 流程
+## 6. Switchover Process
+
+> 📖 **Source**: [Switching a Blue/Green Deployment](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/blue-green-deployments-switching.html)
 
 > ⛔ **絕對不要手動 Promote Green！** 不要在 Green 環境的 Actions 選單選「Promote」。手動 Promote 會直接斷掉 Replication，Blue/Green Deployment 進入 **Invalid configuration** 狀態，只能刪除重建。**必須使用 Switchover 功能，不是 Promote**。
 
-### Guardrails 檢查
+### Guardrails Check
 
 Switchover 開始前，AWS 會執行一系列檢查（稱為 Guardrails）：
 
@@ -395,7 +418,7 @@ Switchover 開始前，AWS 會執行一系列檢查（稱為 Guardrails）：
 
 如果任一檢查失敗，Switchover 會被取消。
 
-#### Logical Replication 額外 Guardrail（PostgreSQL Major Upgrade）
+#### Logical Replication Extra Guardrails (PostgreSQL Major Upgrade)
 
 使用 Logical Replication 時，Guardrails 會額外檢查：
 - Green 環境有沒有收到**不該有的 DDL 變更**
@@ -408,7 +431,7 @@ Switchover 開始前，AWS 會執行一系列檢查（稱為 Guardrails）：
 
 > **Switchover 失敗是安全的**：如果 Switchover 因任何原因中斷（timeout、guardrail 失敗），所有變更會被**回滾**。兩邊環境都不受影響，可以修正問題後重試。
 
-### Switchover 步驟
+### Switchover Steps
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
@@ -446,7 +469,7 @@ Switchover 開始前，AWS 會執行一系列檢查（稱為 Guardrails）：
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-### Switchover 後 Blue 變成 Read-Only
+### Blue Becomes Read-Only After Switchover
 
 Switchover 完成後，舊的 Blue 環境會**自動變成 Read-Only**（防止應用程式誤寫舊 DB）。
 
@@ -455,21 +478,21 @@ Switchover 完成後，舊的 Blue 環境會**自動變成 Read-Only**（防止�
 | **MySQL** | `read_only = 1`（可能加上 `super_read_only = 1`）| 透過 `rdsadmin` 帳號設定 |
 | **PostgreSQL** | `default_transaction_read_only = on` | 透過 `rdsadmin` 帳號設定 |
 
-**為什麼 read_only 對你的帳號有效？** 因為你的 master user 只有 `rds_superuser` 角色，**沒有**真正的 MySQL `SUPER` 或 PostgreSQL `superuser` 權限，所以無法繞過 read_only。詳見[附錄 A：RDS 內部帳號架構](#附錄-a-rds-內部帳號架構)。
+**為什麼 read_only 對你的帳號有效？** 因為你的 master user 只有 `rds_superuser` 角色，**沒有**真正的 MySQL `SUPER` 或 PostgreSQL `superuser` 權限，所以無法繞過 read_only。詳見[附錄 A：RDS Internal Account Architecture](#appendix-a-rds-internal-account-architecture)。
 
 **如何恢復寫入**（不能直接用 SQL）：
 1. 修改 Parameter Group：`read_only = 0`（MySQL）或 `default_transaction_read_only = off`（PostgreSQL）
 2. Reboot Instance
 3. AWS 的 `rdsadmin` 帳號會套用新設定
 
-### Endpoint 重新命名與 DNS
+### Endpoint Renaming and DNS
 
 AWS 的做法是直接改 **Instance Identifier**，而不是 DNS 切換：
 - `mydb-green-xxx` 直接變成 `mydb`
 - Endpoint 格式是 `{instance-id}.xxx.{region}.rds.amazonaws.com`
 - 所以 Endpoint 自動就變了
 
-#### DNS TTL：必須 ≤ 5 秒
+#### DNS TTL: Must Be ≤ 5 Seconds
 
 RDS DNS zone 預設 TTL 就是 **5 秒**（不是 60 秒！）。問題出在 Application 和 Network 層會「偷 cache」：
 
@@ -504,11 +527,11 @@ java.security.Security.setProperty("networkaddress.cache.ttl", "5");
   - 解法：設定 `maxLifetime`（HikariCP 建議 `maxLifetime = 1800000`，30 分鐘）
 - **中間 Network 設備**：公司 DNS resolver、Load Balancer、VPN gateway
 
-### Tag 行為
+### Tag Behavior
 
 Switchover 時，**Blue 的 tags 會覆蓋 Green 的所有 tags**。如果在 Green 測試期間加了 tags（如 `environment=staging`），Switchover 後會被 Blue 的 tags 蓋掉。建議所有重要 tags 在建立前就設定在 Blue 上。
 
-### PostgreSQL ANALYZE（Logical Replication）
+### PostgreSQL ANALYZE (Logical Replication)
 
 使用 Logical Replication 做 Major version upgrade 時，Switchover 前必須在所有 database 執行 `ANALYZE`：
 
@@ -518,7 +541,7 @@ ANALYZE;
 
 **原因**：Logical Replication **不會同步** `pg_statistic`（query optimizer 的統計資料）。如果不跑 ANALYZE，Switchover 後 query optimizer 沒有統計資料，查詢效能可能暴跌。
 
-### Timeout 設定
+### Timeout Settings
 
 | 設定值 | 說明 |
 |--------|------|
@@ -528,7 +551,7 @@ ANALYZE;
 
 如果在 Timeout 時間內無法完成同步，Switchover 會失敗並回滾。
 
-### 監控 Switchover
+### Monitoring Switchover
 
 #### CloudWatch Metrics
 
@@ -538,7 +561,7 @@ ANALYZE;
 | `DatabaseConnections` | 連線數量 |
 | `CPUUtilization` | CPU 使用率 |
 
-#### PostgreSQL 監控查詢
+#### PostgreSQL Monitoring Queries
 
 檢查 Replication Lag：
 ```sql
@@ -566,11 +589,11 @@ WHERE xact_start IS NOT NULL
 ORDER BY xact_start;
 ```
 
-### 更新外部 Replicas (MySQL/MariaDB)
+### Updating External Replicas (MySQL/MariaDB)
 
 如果你有外部的 Read Replica（不在 Blue/Green Topology 內），Switchover 後需要手動更新。
 
-#### 完整流程
+#### Full Process
 
 **Step 1**：Switchover 後，Green DB instance 會發出一個 Event，內含 binary log 座標：
 
@@ -594,19 +617,19 @@ CHANGE REPLICATION SOURCE TO
 START REPLICA;
 ```
 
-> **來源**: [Switching a Blue/Green Deployment](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/blue-green-deployments-switching.html)
-
 ---
 
-## 7. 刪除 Blue/Green Deployment
+## 7. Deleting a Blue/Green Deployment
 
-### 何時刪除
+> 📖 **Source**: [Deleting a Blue/Green Deployment](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/blue-green-deployments-deleting.html)
+
+### When to Delete
 
 - **Switchover 完成後**：測試確認沒問題，可以刪除舊的 Blue 環境
 - **不再需要時**：決定不繼續 Blue/Green Deployment
 - **發現問題時**：需要放棄這次部署
 
-### 保留 vs 刪除 Green 環境
+### Retain vs Delete Green Environment
 
 刪除 Blue/Green Deployment 時，可以選擇是否保留 Green 環境：
 
@@ -617,7 +640,7 @@ START REPLICA;
 
 **注意**：刪除 Blue/Green Deployment 本身不會刪除任何 DB Instance，只是解除它們之間的關聯。你需要另外手動刪除不需要的 DB Instance。
 
-### 刪除方式
+### Deletion Methods
 
 #### Console
 1. 選擇要刪除的 Blue/Green Deployment
@@ -633,13 +656,13 @@ aws rds delete-blue-green-deployment \
 
 `--delete-target` 參數決定是否刪除 Green 環境。
 
-> **來源**: [Deleting a Blue/Green Deployment](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/blue-green-deployments-deleting.html)
-
 ---
 
-## 8. 限制與注意事項
+## 8. Limitations & Considerations
 
-### 一般限制
+> 📖 **Source**: [Blue/Green Deployment Considerations](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/blue-green-deployments-considerations.html)
+
+### General Limitations
 
 這些功能目前不支援 Blue/Green：
 
@@ -658,7 +681,7 @@ aws rds delete-blue-green-deployment \
 | **Zero-ETL Integration** | 如果有和 Amazon Redshift 的 zero-ETL integration，Switchover 前**必須先刪除**，之後再重建 |
 | **DMS Task 不能延續** | Switchover 後 AWS DMS replication task 無法繼續，因為 Blue 的 checkpoint 在 Green 環境無效，必須用新的 checkpoint 重建 DMS task |
 
-### MySQL 特定限制
+### MySQL-Specific Limitations
 
 | 限制 | 說明 |
 |------|------|
@@ -667,7 +690,7 @@ aws rds delete-blue-green-deployment \
 | **MyISAM 引擎** | 建議不要使用 MyISAM，可能有複製問題 |
 | **部分表複製** | 不支援只複製部分表 |
 
-### PostgreSQL Physical Replication 限制
+### PostgreSQL Physical Replication Limitations
 
 | 限制 | 說明 |
 |------|------|
@@ -675,25 +698,21 @@ aws rds delete-blue-green-deployment \
 | **Parameter Group 限制** | 部分參數不能變更 |
 | **Extension 安裝** | 不能在 Green 環境安裝新的 Extension |
 
-### PostgreSQL Logical Replication 限制
+### PostgreSQL Logical Replication Limitations
 
-這是做 Major 版本升級時要特別注意的：
+以下列出 [§4 Logical Replication Limitations](#logical-replication-limitations) 未涵蓋的額外限制：
 
 | 限制 | 說明 |
 |------|------|
-| **DDL 不複製** | `CREATE TABLE`, `ALTER TABLE`, `DROP TABLE` 等不會同步 |
-| **需要 Primary Key** | 沒有 PK 的表無法執行 `UPDATE`/`DELETE` 複製 |
-| **需要 Replica Identity** | 沒有 PK 的表需要設定 `REPLICA IDENTITY FULL` |
-| **Large Objects** | `bytea` 之外的 Large Objects 不會複製 |
-| **Sequence 值** | Sequence 的 last value 不會自動同步，需手動處理 |
-| **TRUNCATE** | `TRUNCATE` 指令不會複製（PG 11-14）|
 | **DCL 不複製** | `GRANT`、`REVOKE` 等權限控制語句不會同步到 Green |
 | **Single-Threaded** | Logical Replication 的 apply process 是**單執行緒**的，高寫入量可能追不上，考慮改用 AWS DMS |
 | **Unlogged Tables** | Unlogged tables 不寫 WAL，在 Logical Replication 下**不會被複製到 Green** |
 | **Materialized Views** | Switchover 後 Green 的 Materialized Views **不會自動更新**，需手動 `REFRESH MATERIALIZED VIEW` |
 | **Partitioned Tables** | 部署期間**不能**對 partitioned tables 建立新的 partition（`CREATE TABLE` 是 DDL，不會複製） |
 
-### Extension 限制
+> 完整的基礎限制（DDL 不複製、需要 PK、Replica Identity、Large Objects、Sequence、TRUNCATE）見 [§4 Logical Replication Limitations](#logical-replication-limitations)。
+
+### Extension Limitations
 
 以下 Extension 在 Logical Replication 時可能有問題：
 
@@ -705,7 +724,7 @@ aws rds delete-blue-green-deployment \
 | **postgis** | Topology 相關功能可能有問題 |
 | **pg_stat_statements** | 統計資料不會複製 |
 
-### Post-Switchover 資源更新清單
+### Post-Switchover Resource Update Checklist
 
 Switchover 完成後，以下資源可能需要手動更新：
 
@@ -719,15 +738,15 @@ Switchover 完成後，以下資源可能需要手動更新：
 | **EventBridge Rules** | 可能引用舊的 Instance |
 | **外部監控系統** | 如 Datadog, New Relic 等 |
 
-> **來源**: [Blue/Green Deployment Considerations](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/blue-green-deployments-considerations.html)
-
 ---
 
 ## 9. Best Practices
 
-### 通用建議
+> 📖 **Source**: [Blue/Green Deployment Best Practices](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/blue-green-deployments-best-practices.html)
 
-#### Switchover 前檢查清單
+### General Recommendations
+
+#### Pre-Switchover Checklist
 
 - [ ] Replica Lag 接近 0
 - [ ] 沒有長時間執行的 Query（建議 < 10 秒）
@@ -735,23 +754,22 @@ Switchover 完成後，以下資源可能需要手動更新：
 - [ ] 應用程式有 Retry 機制（連線中斷時會自動重連）
 - [ ] 選擇低流量時段
 - [ ] 已在 Green 環境完成必要測試
+- [ ] DNS cache TTL ≤ 5 秒（見 [§6 DNS TTL](#dns-ttl-must-be--5-seconds)）
+- [ ] Storage Initialization 已完成（見 [§5 Lazy Loading](#lazy-loading--storage-initialization)）
 
-#### 測試建議
+#### Testing Recommendations
 
-> "You can make changes to the RDS DB instances in the green environment without affecting production workloads. ... You can thoroughly test changes in the green environment."
-> — [Blue/Green Deployments Overview](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/blue-green-deployments-overview.html)
+Green 環境有獨立的臨時 endpoint 可直接連線測試（見 [§1 FAQ](#faq)）。
 
 1. **功能測試**：在 Green 環境執行應用程式的關鍵功能測試
 2. **效能測試**：比較 Blue 和 Green 的查詢效能
 3. **連線測試**：確認應用程式可以正確連線到 Green
 
-> ⚠️ "During testing, we recommend that you keep your databases in the green environment read only. Enable write operations on the green environment with caution because they can result in replication conflicts."
+> ⚠️ 測試時建議保持 Green 為唯讀，避免 replication conflicts。測試前務必完成 Storage Initialization，否則效能測試結果不準確。
 
-> ⚠️ "After you create the blue/green deployment, handle lazy loading if necessary. Make sure data loading is complete before switching over." — 測試前務必完成 Storage Initialization，否則效能測試結果不準確。
+### MySQL Optimization
 
-### MySQL 最佳化設定
-
-#### GTID 設定
+#### GTID Settings
 
 如果有 Read Replica，強烈建議使用 GTID：
 
@@ -760,18 +778,18 @@ gtid_mode = ON
 enforce_gtid_consistency = ON
 ```
 
-#### Binary Log 最佳化
+#### Binary Log Optimization
 
 ```
 binlog_format = ROW
 sync_binlog = 1  # 確保資料一致性
 ```
 
-#### 降低 Replica Lag 的兩個手段
+#### Reducing Replica Lag
 
 如果 Green 的 Replica Lag 太高，可以考慮以下暫時措施：
 
-**手段一：調整 `innodb_flush_log_at_trx_commit`**
+**Option 1: Adjust `innodb_flush_log_at_trx_commit`**
 
 ```
 # 暫時設定（在 Green 環境）
@@ -782,15 +800,15 @@ innodb_flush_log_at_trx_commit = 2
 - ⚠️ **風險**：如果中間 crash，可能有 1 秒的 data loss，需要重建 Green
 - **Switchover 前務必改回 `1`**
 
-**手段二：暫時改為 Single-AZ**
+**Option 2: Temporarily Switch to Single-AZ**
 
 - 暫時把 Green 的 Multi-AZ 改成 Single-AZ
 - 減少寫入延遲（不用同步到 Standby），提高 replication throughput
 - **Switchover 前再改回 Multi-AZ**
 
-### PostgreSQL 最佳化設定
+### PostgreSQL Optimization
 
-#### WAL 設定（適用於 Logical Replication）
+#### WAL Settings (for Logical Replication)
 
 ```
 # 確保有足夠的 replication slots
@@ -820,7 +838,7 @@ wal_sender_timeout = 0     # 停用 timeout
 logical_decoding_work_mem = 256  # MB，預設 65 MB
 ```
 
-#### 處理長時間交易
+#### Handling Long-Running Transactions
 
 長時間交易是 Switchover 的最大敵人。建議：
 
@@ -843,7 +861,7 @@ ORDER BY xact_start;
 SELECT pg_terminate_backend(pid);
 ```
 
-#### Sequence 同步（Logical Replication）
+#### Sequence Sync (Logical Replication)
 
 Switchover 前，需要手動同步 Sequence 值：
 
@@ -857,7 +875,7 @@ JOIN pg_sequences ps ON s.sequence_name = ps.sequencename;
 SELECT setval('your_sequence_name', <value_from_blue>);
 ```
 
-#### Trigger 注意事項（Logical Replication）
+#### Trigger Considerations (Logical Replication)
 
 如果 Green 環境有設定 `ENABLE REPLICA` 或 `ENABLE ALWAYS` 的 trigger：
 
@@ -867,20 +885,11 @@ SELECT setval('your_sequence_name', <value_from_blue>);
 
 **建議**：Switchover 前檢查並調整 Green 環境的 trigger 設定。
 
-### DNS TTL 建議
+### DNS TTL Recommendations
 
-> ⚠️ AWS 官方要求：DNS cache TTL **不能超過 5 秒**。
+確保所有層級的 DNS cache TTL ≤ 5 秒，包含 JVM、OS、Connection Pool 和中間 Network 設備。詳細的 DNS cache 問題分析和各層修正方式，見 [§6 Endpoint Renaming and DNS](#endpoint-renaming-and-dns)。
 
-雖然 AWS 用 Endpoint 重新命名來實現切換，但應用程式和網路層的 DNS cache 仍然是最大的風險：
-
-- **JVM（最常見的坑）**：Java 預設**永久 cache DNS**，必須設定 `networkaddress.cache.ttl=5`
-- **Connection Pool**：設定合理的 `maxLifetime`
-- **OS DNS Cache**：確認沒有設定過長的 cache TTL
-- 確保應用程式有連線重試邏輯
-
-> 詳細的 DNS cache 問題分析和修正方式，見[第 6 節：Endpoint 重新命名與 DNS](#endpoint-重新命名與-dns)。
-
-### CloudWatch 監控指標
+### CloudWatch Metrics
 
 建議在部署期間持續監控以下指標：
 
@@ -893,13 +902,13 @@ SELECT setval('your_sequence_name', <value_from_blue>);
 | `DatabaseConnections` | 連線數量 | Switchover 時會歸零再恢復 |
 | `CPUUtilization` | CPU 使用率 | Replication 會增加 CPU 負載 |
 
-> **來源**: [Blue/Green Deployment Best Practices](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/blue-green-deployments-best-practices.html)
-
 ---
 
-## 10. IAM 授權
+## 10. IAM Authorization
 
-### 建立 Blue/Green Deployment 所需權限
+> 📖 **Source**: [Authorizing Access](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/blue-green-deployments-authorizing-access.html)
+
+### Creating a Blue/Green Deployment
 
 ```json
 {
@@ -927,7 +936,7 @@ SELECT setval('your_sequence_name', <value_from_blue>);
 }
 ```
 
-### Switchover 所需權限
+### Switchover
 
 ```json
 {
@@ -946,7 +955,7 @@ SELECT setval('your_sequence_name', <value_from_blue>);
 }
 ```
 
-### 刪除 Blue/Green Deployment 所需權限
+### Deleting a Blue/Green Deployment
 
 ```json
 {
@@ -965,7 +974,7 @@ SELECT setval('your_sequence_name', <value_from_blue>);
 }
 ```
 
-### 完整管理權限
+### Full Management Permissions
 
 如果需要完整管理 Blue/Green Deployment：
 
@@ -987,13 +996,11 @@ SELECT setval('your_sequence_name', <value_from_blue>);
 }
 ```
 
-> **來源**: [Authorizing Access to Blue/Green Deployment Operations](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/blue-green-deployments-authorizing-access.html)
-
 ---
 
-## 11. 成本考量
+## 11. Cost Considerations
 
-### 費用項目
+### Cost Items
 
 | 項目 | 成本影響 |
 |------|---------|
@@ -1003,13 +1010,13 @@ SELECT setval('your_sequence_name', <value_from_blue>);
 | **Replication 流量** | 同 Region 通常免費 |
 | **Backup Storage** | Green 環境的自動備份 |
 
-### 成本最佳化建議
+### Cost Optimization
 
 1. **縮短 Green 環境存在時間**：建立後儘快完成測試和 Switchover
 2. **選擇適當時機**：避免在 Green 環境上執行不必要的工作負載
 3. **及時清理**：Switchover 後，評估是否需要保留舊的 Blue 環境
 
-### 費用估算範例
+### Cost Estimation Example
 
 假設你的 Blue 環境是：
 - db.r5.xlarge (4 vCPU, 32 GB RAM)
@@ -1025,13 +1032,37 @@ Green 環境存在 7 天的額外費用約：
 
 ---
 
-## 附錄 A: RDS 內部帳號架構
+## 12. References
 
-### rdsadmin 帳號
+### Official Documentation
+
+| 主題 | 連結 |
+|------|------|
+| Overview | [blue-green-deployments-overview.html](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/blue-green-deployments-overview.html) |
+| Supported Regions and Engines | [Concepts.RDS_Fea_Regions_DB-eng.Feature.BlueGreenDeployments.html](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/Concepts.RDS_Fea_Regions_DB-eng.Feature.BlueGreenDeployments.html) |
+| Creating | [blue-green-deployments-creating.html](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/blue-green-deployments-creating.html) |
+| Switching | [blue-green-deployments-switching.html](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/blue-green-deployments-switching.html) |
+| Deleting | [blue-green-deployments-deleting.html](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/blue-green-deployments-deleting.html) |
+| Considerations (Limitations) | [blue-green-deployments-considerations.html](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/blue-green-deployments-considerations.html) |
+| Best Practices | [blue-green-deployments-best-practices.html](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/blue-green-deployments-best-practices.html) |
+| PostgreSQL Replication Type | [blue-green-deployments-replication-type.html](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/blue-green-deployments-replication-type.html) |
+| IAM Authorization | [blue-green-deployments-authorizing-access.html](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/blue-green-deployments-authorizing-access.html) |
+
+### Related Resources
+
+- [AWS RDS User Guide](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/)
+- [AWS CLI rds Commands](https://docs.aws.amazon.com/cli/latest/reference/rds/)
+- [AWS RDS Pricing](https://aws.amazon.com/rds/pricing/)
+
+---
+
+## Appendix A: RDS Internal Account Architecture
+
+### rdsadmin Account
 
 `rdsadmin` 是 AWS 植入在**每個 RDS instance** 裡的內部管理帳號。你看不到它的完整權限，也無法用它登入。
 
-#### RDS Instance 建立流程
+#### RDS Instance Creation Flow
 
 ```
 你按下 "Create Database"
@@ -1048,7 +1079,7 @@ Green 環境存在 7 天的額外費用約：
 └───────────────────────────────────────┘
 ```
 
-### 權限層級架構
+### Permission Hierarchy
 
 ```
 ┌──────────────────────────┐
@@ -1064,7 +1095,7 @@ Green 環境存在 7 天的額外費用約：
 
 **核心概念**：RDS **不會**給你真正的 MySQL `root` 或 PostgreSQL `superuser`。你的 master user 有 `rds_superuser` 角色，但沒有 `SUPER` privilege。
 
-### rdsadmin 的工作
+### rdsadmin Responsibilities
 
 | 工作 | 說明 |
 |------|------|
@@ -1075,9 +1106,9 @@ Green 環境存在 7 天的額外費用約：
 | **Parameter 套用** | 當你改 Parameter Group 時，rdsadmin 去執行 |
 | **Read-only 控制** | Switchover 後設定 `read_only` |
 
-### 為什麼 read_only 對你有效
+### Why read_only Affects You
 
-#### MySQL 的兩層 Read-Only
+#### MySQL Two-Layer Read-Only
 
 | 參數 | 擋誰 | 說明 |
 |------|------|------|
@@ -1086,7 +1117,7 @@ Green 環境存在 7 天的額外費用約：
 
 因為你的 master user **沒有 SUPER 權限**，所以 `read_only = 1` 就足以擋住你。
 
-#### 你不能直接用 SQL 關掉 read_only
+#### You Cannot Disable read_only via SQL
 
 ```sql
 -- MySQL
@@ -1100,7 +1131,7 @@ SET default_transaction_read_only = off;
 
 必須透過 Parameter Group 修改 + Reboot。
 
-### MySQL Master User 沒有的權限
+### MySQL Master User Missing Permissions
 
 | 缺少的權限 | 影響 |
 |-----------|------|
@@ -1108,7 +1139,7 @@ SET default_transaction_read_only = off;
 | `FILE` | 不能直接讀寫 server 上的檔案 |
 | `SHUTDOWN` | 不能關掉 database |
 
-### MySQL Stored Procedures（替代 SUPER 功能）
+### MySQL Stored Procedures (Replacing SUPER)
 
 AWS 提供了 stored procedures 來替代你缺少的 SUPER 權限：
 
@@ -1120,7 +1151,7 @@ CALL mysql.rds_kill(thread_id);
 CALL mysql.rds_set_external_source(...);
 ```
 
-### PostgreSQL Master User 權限細節
+### PostgreSQL Master User Permission Details
 
 ```sql
 -- rdsadmin 是真正的 superuser
@@ -1145,27 +1176,3 @@ SELECT rolname FROM pg_roles WHERE oid IN (
 - 直接操作 `pg_catalog`
 - 修改 `rdsadmin` 的權限
 - 存取 OS file system
-
----
-
-## 12. 參考資料
-
-### 官方文檔完整連結
-
-| 主題 | 連結 |
-|------|------|
-| Overview | [blue-green-deployments-overview.html](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/blue-green-deployments-overview.html) |
-| Supported Regions and Engines | [Concepts.RDS_Fea_Regions_DB-eng.Feature.BlueGreenDeployments.html](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/Concepts.RDS_Fea_Regions_DB-eng.Feature.BlueGreenDeployments.html) |
-| Creating | [blue-green-deployments-creating.html](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/blue-green-deployments-creating.html) |
-| Switching | [blue-green-deployments-switching.html](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/blue-green-deployments-switching.html) |
-| Deleting | [blue-green-deployments-deleting.html](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/blue-green-deployments-deleting.html) |
-| Considerations (Limitations) | [blue-green-deployments-considerations.html](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/blue-green-deployments-considerations.html) |
-| Best Practices | [blue-green-deployments-best-practices.html](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/blue-green-deployments-best-practices.html) |
-| PostgreSQL Replication Type | [blue-green-deployments-replication-type.html](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/blue-green-deployments-replication-type.html) |
-| IAM Authorization | [blue-green-deployments-authorizing-access.html](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/blue-green-deployments-authorizing-access.html) |
-
-### 相關資源
-
-- [AWS RDS User Guide](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/)
-- [AWS CLI rds Commands](https://docs.aws.amazon.com/cli/latest/reference/rds/)
-- [AWS RDS Pricing](https://aws.amazon.com/rds/pricing/)
