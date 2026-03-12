@@ -120,15 +120,17 @@ Decision 5: 交付格式（獨立，可最後決定）
 
 ## 3. 策略決策
 
-> **格式說明**：每個 Decision 使用統一模板，包含問題、AWS 對照、選項比較、建議與討論問題。
+> **格式說明**：每個 Decision 使用統一模板——問題、影響範圍、AWS 對照（blockquote）、選項比較、建議與討論問題。
 
 ---
 
 ### Decision 0：策略選擇（New Green vs Zone-B）
 
 **問題**：Blue/Green 策略要建立全新 Green Cluster，還是重用現有 Zone-B？
-**AWS 對照**：AWS 自動複製整個 Topology（Primary + Replicas + Multi-AZ Standby）為 Green。自建環境無此自動化，需選擇策略。→ Section 3: How It Works
 **影響範圍**：Decision 1, 2, 3, 4, 8 的選項都取決於此
+
+> **AWS 對照**：AWS 自動複製整個 Topology（Primary + Replicas + Multi-AZ Standby）為 Green。自建環境無此自動化，需選擇策略。
+> → Section 3: How It Works
 **前置決策**：無（這是最上游的決策）
 
 #### 選項比較
@@ -206,8 +208,10 @@ Decision 5: 交付格式（獨立，可最後決定）
 ### Decision 1：Green 環境初始化策略
 
 **問題**：Green 環境的資料從哪裡來？
-**AWS 對照**：AWS 自動 Snapshot Blue → Restore 為 Green，並支援 Lazy Loading。自建需自行選擇資料初始化方式。→ Section 5: Creating
 **影響範圍**：決定 Green 環境建立時間，影響整體流程時長
+
+> **AWS 對照**：AWS 自動 Snapshot Blue → Restore 為 Green，並支援 Lazy Loading。自建需自行選擇資料初始化方式。
+> → Section 5: Creating
 **前置決策**：Decision 0 = Option A（Option B 可跳過此決策，Zone-B 已有資料）
 
 #### 選項比較
@@ -234,8 +238,10 @@ Decision 5: 交付格式（獨立，可最後決定）
 ### Decision 2：Blue/Green 期間的 Replication 拓撲
 
 **問題**：Blue Primary 與 Green Cluster 之間的 Replication 用什麼拓撲？
-**AWS 對照**：AWS 自動配置 binlog replication（MySQL）或 WAL/Logical replication（PostgreSQL）。自建需決定 Replication 拓撲。→ Section 3: Replication Mechanism
 **影響範圍**：影響 Green 環境的同步延遲和 Blue Primary 負載
+
+> **AWS 對照**：AWS 自動配置 binlog replication（MySQL）或 WAL/Logical replication（PostgreSQL）。自建需決定 Replication 拓撲。
+> → Section 3: Replication Mechanism
 **前置決策**：Decision 0 = Option A
 
 #### 選項比較
@@ -271,8 +277,10 @@ Option B: 扇出式（Fan-out）
 ### Decision 3：Switchover 機制
 
 **問題**：DB Cluster 內部用什麼機制切換流量（Layer 2）？
-**AWS 對照**：AWS 透過 Endpoint Renaming（Instance Identifier 互換 + DNS TTL ≤ 5s）實現流量切換。自建環境使用 K8s Service selector 達到相同效果。→ Section 6: Switchover Steps
 **影響範圍**：Decision 6, 7 的設計都建立在此機制之上
+
+> **AWS 對照**：AWS 透過 Endpoint Renaming（Instance Identifier 互換 + DNS TTL ≤ 5s）實現流量切換。自建環境使用 K8s Service selector 達到相同效果。
+> → Section 6: Switchover Steps
 **前置決策**：Decision 0（Option B 需額外處理 Layer 1）
 
 #### 連線路徑分層
@@ -341,8 +349,10 @@ Option B: 扇出式（Fan-out）
 ### Decision 4：Switchover 期間的 Zone-B 處理
 
 **問題**：Switchover 期間和之後，Zone-B（DR）如何處理？
-**AWS 對照**：AWS Switchover 後，外部 Read Replica 需手動 `CHANGE REPLICATION SOURCE TO` 重新指向 Green。自建的 Zone-B 也需要相同處理。→ Section 6: Updating External Replicas
 **影響範圍**：影響 DR 可用性和 Switchover 後的恢復流程
+
+> **AWS 對照**：AWS Switchover 後，外部 Read Replica 需手動 `CHANGE REPLICATION SOURCE TO` 重新指向 Green。自建的 Zone-B 也需要相同處理。
+> → Section 6: Updating External Replicas
 **前置決策**：Decision 0（行為完全取決於 D0 的選擇）
 
 #### 選項比較
@@ -386,8 +396,10 @@ Zone-A 變成新的 DR。Replication 方向反轉。
 ### Decision 5：交付格式
 
 **問題**：Blue/Green 流程的自動化程度做到什麼層級？
-**AWS 對照**：AWS 提供 Console UI + CLI + IAM 三層交付。自建環境需自行選擇工具鏈。→ Section 9: Best Practices + Section 10: IAM
 **影響範圍**：決定 Phase 1 的實作工作量和長期維護成本
+
+> **AWS 對照**：AWS 提供 Console UI + CLI + IAM 三層交付。自建環境需自行選擇工具鏈。
+> → Section 9: Best Practices + Section 10: IAM
 **前置決策**：無（獨立決策，可最後決定）
 
 #### 選項比較
@@ -414,8 +426,10 @@ Zone-A 變成新的 DR。Replication 方向反轉。
 ### Decision 6：Guardrails 檢查
 
 **問題**：Switchover 執行前，必須通過哪些檢查項目？
-**AWS 對照**：AWS 內建 5 項 Guardrails（Replication Status、Lag、Long-running TX、Active DDL 等），任一失敗即取消 Switchover。自建需自行定義檢查清單。→ Section 6: Guardrails
 **影響範圍**：決定 Switchover 腳本中的 pre-flight check 清單
+
+> **AWS 對照**：AWS 內建 5 項 Guardrails（Replication Status、Lag、Long-running TX、Active DDL 等），任一失敗即取消 Switchover。自建需自行定義檢查清單。
+> → Section 6: Guardrails
 **前置決策**：Decision 3（Switchover 機制確定後才能定義具體檢查項）
 
 #### 選項比較
@@ -448,8 +462,10 @@ Zone-A 變成新的 DR。Replication 方向反轉。
 ### Decision 7：回滾與 Timeout
 
 **問題**：Switchover 失敗時怎麼辦？等多久算失敗？
-**AWS 對照**：AWS 提供 Timeout 設定（30s–3600s，預設 300s），失敗自動回滾。自建需自行設計 Timeout 和 Rollback 邏輯。→ Section 6: Timeout Settings
 **影響範圍**：決定 Switchover 腳本中的 timeout 和 rollback 邏輯
+
+> **AWS 對照**：AWS 提供 Timeout 設定（30s–3600s，預設 300s），失敗自動回滾。自建需自行設計 Timeout 和 Rollback 邏輯。
+> → Section 6: Timeout Settings
 **前置決策**：Decision 3（回滾動作取決於 Switchover 機制）
 
 #### 選項比較
@@ -486,8 +502,10 @@ Zone-A 變成新的 DR。Replication 方向反轉。
 ### Decision 8：排程任務處理
 
 **問題**：Green 環境的 Event Scheduler 是否開啟？
-**AWS 對照**：AWS 明確要求 Green 的 `event_scheduler=OFF`，因為 Blue 的 Event DML 會透過 Replication 傳到 Green，重複執行會導致資料不一致。→ Section 5: Prerequisites
 **影響範圍**：避免 Blue 和 Green 同時執行排程任務導致資料不一致
+
+> **AWS 對照**：AWS 明確要求 Green 的 `event_scheduler=OFF`，因為 Blue 的 Event DML 會透過 Replication 傳到 Green，重複執行會導致資料不一致。
+> → Section 5: Prerequisites
 **前置決策**：Decision 0（需知道 Green 環境的建立方式）
 
 #### 選項比較
