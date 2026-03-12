@@ -1,6 +1,6 @@
 # Self-Hosted DBaaS Blue/Green Deployment 設計文件
 
-> **文件定位**：這是一份**團隊決策討論工具**——聚焦「我們要做哪些決策」，團隊可以逐項討論、記錄結論。
+> 本文整理自建 Blue/Green Deployment 的關鍵設計決策，每個 Decision 附上選項比較與討論問題。
 
 ---
 
@@ -109,7 +109,7 @@ Decision 5: 交付格式（獨立，可最後決定）
 | 0 | 策略選擇 | New Green or reuse Zone-B？ | 3 | 無 | 視 DR SLA |
 | 1 | Green 初始化 | 資料怎麼來？ | 3 | D0=A | Snapshot |
 | 2 | Replication 拓撲 | Chain or Fan-out？ | 2 | D0=A | Chain |
-| 3 | Switchover 機制 | Layer 2 用什麼切？ | 2 | D0 | K8s Service |
+| 3 | Switchover 機制 | DB Cluster 內部如何切換流量？ | 1 | D0 | K8s Service |
 | 4 | Zone-B 處理 | Switchover 期間 DR 怎麼辦？ | - | D0 | 依 D0 |
 | 5 | 交付格式 | 自動化到什麼程度？ | 4 | 無 | Runbook 起步 |
 | 6 | Guardrails | Switchover 前查什麼？ | - | D3 | 新增 |
@@ -120,13 +120,14 @@ Decision 5: 交付格式（獨立，可最後決定）
 
 ## 3. 策略決策
 
-> **格式說明**：每個 Decision 使用統一模板，團隊可逐項討論並填入結論。
+> **格式說明**：每個 Decision 使用統一模板，包含問題、AWS 對照、選項比較、建議與討論問題。
 
 ---
 
 ### Decision 0：策略選擇（New Green vs Zone-B）
 
 **問題**：Blue/Green 策略要建立全新 Green Cluster，還是重用現有 Zone-B？
+**AWS 對照**：AWS 自動複製整個 Topology（Primary + Replicas + Multi-AZ Standby）為 Green。自建環境無此自動化，需選擇策略。→ Section 3: How It Works
 **影響範圍**：Decision 1, 2, 3, 4, 8 的選項都取決於此
 **前置決策**：無（這是最上游的決策）
 
@@ -200,15 +201,12 @@ Decision 5: 交付格式（獨立，可最後決定）
 - [ ] Primary Zone 改變（Option B/C）對網路延遲和 App 效能的影響可接受嗎？
 - [ ] 我們有多少信心能在 Zone-B 升級失敗時快速恢復 DR？
 
-#### 結論
-
-> _（討論後填寫）_
-
 ---
 
 ### Decision 1：Green 環境初始化策略
 
 **問題**：Green 環境的資料從哪裡來？
+**AWS 對照**：AWS 自動 Snapshot Blue → Restore 為 Green，並支援 Lazy Loading。自建需自行選擇資料初始化方式。→ Section 5: Creating
 **影響範圍**：決定 Green 環境建立時間，影響整體流程時長
 **前置決策**：Decision 0 = Option A（Option B 可跳過此決策，Zone-B 已有資料）
 
@@ -231,15 +229,12 @@ Decision 5: 交付格式（獨立，可最後決定）
 - [ ] 最大 DB 實例的大小是多少？對應的 Snapshot/Restore 時間預估？
 - [ ] Backup 工具（mariabackup/mysqldump）是否已在生產環境驗證？
 
-#### 結論
-
-> _（討論後填寫）_
-
 ---
 
 ### Decision 2：Blue/Green 期間的 Replication 拓撲
 
 **問題**：Blue Primary 與 Green Cluster 之間的 Replication 用什麼拓撲？
+**AWS 對照**：AWS 自動配置 binlog replication（MySQL）或 WAL/Logical replication（PostgreSQL）。自建需決定 Replication 拓撲。→ Section 3: Replication Mechanism
 **影響範圍**：影響 Green 環境的同步延遲和 Blue Primary 負載
 **前置決策**：Decision 0 = Option A
 
@@ -271,15 +266,12 @@ Option B: 扇出式（Fan-out）
 - [ ] Green Replica 延遲增加（Chain 中轉）是否影響驗證測試的準確性？
 - [ ] operator 是否確實不支援外部 Replication 管理？
 
-#### 結論
-
-> _（討論後填寫）_
-
 ---
 
 ### Decision 3：Switchover 機制
 
 **問題**：DB Cluster 內部用什麼機制切換流量（Layer 2）？
+**AWS 對照**：AWS 透過 Endpoint Renaming（Instance Identifier 互換 + DNS TTL ≤ 5s）實現流量切換。自建環境使用 K8s Service selector 達到相同效果。→ Section 6: Switchover Steps
 **影響範圍**：Decision 6, 7 的設計都建立在此機制之上
 **前置決策**：Decision 0（Option B 需額外處理 Layer 1）
 
@@ -290,7 +282,7 @@ Option B: 扇出式（Fan-out）
 │                                                                      │
 │   App Cluster ──────► Ingress Gateway ──────► DB K8s Cluster         │
 │                                                                      │
-│   · Ingress Gateway 是跨叢集的固定入口，兩種方案都必經                     │
+│   · Ingress Gateway 是跨叢集的固定入口                                  │
 │   · Option A（同 Zone 切換）：Layer 1 不需要修改                         │
 │   · Option B（跨 Zone 切換）：Layer 1 的 Gateway 路由目標需要更新          │
 │                                                                      │
@@ -299,18 +291,12 @@ Option B: 扇出式（Fan-out）
                               ▼
 ┌─ Layer 2：DB Cluster 內部（Switchover 的決策點）─────────────────────────┐
 │                                                                      │
-│   方案 A（K8s Service selector）：                                     │
+│   K8s Service selector：                                              │
 │     Ingress GW → K8s Service ──selector──► MariaDB Pods              │
 │     切換方式：更新 Service 的 selector 指向 Green Pods                   │
 │                                                                      │
-│   方案 B（ProxySQL）：                                                 │
-│     Ingress GW → K8s Service → ProxySQL → MariaDB Pods               │
-│     切換方式：更新 ProxySQL 的 server list / weight                     │
-│                                                                      │
 └──────────────────────────────────────────────────────────────────────┘
 ```
-
-> **關鍵觀念**：Ingress Gateway 與 ProxySQL **不是**二擇一的關係。Gateway 是 Layer 1 的固定入口，永遠在路徑上。真正的決策點在 Layer 2。
 
 #### DB-level 共用步驟（與 Layer 2 方案無關）
 
@@ -323,18 +309,16 @@ Option B: 扇出式（Fan-out）
 | 5 | **切換流量** | ← Layer 2 方案決定如何執行 |
 | 6 | 驗證端到端連線 | 確認 App 透過 Ingress Gateway → Green 正常讀寫，**寫入暫停結束** |
 
-#### 選項比較
+#### K8s Service selector 行為說明
 
-| 維度 | A. K8s Service selector | B. ProxySQL |
-|------|------------------------|-------------|
-| 切換動作 | `kubectl patch svc` 更新 selector | 更新 ProxySQL server list / weight |
-| 切換粒度 | 全量切換（All-or-Nothing） | 可漸進式切換（調整 weight） |
-| 額外元件 | 無——K8s 原生機制 | 需要部署和維護 ProxySQL |
-| 讀寫分離 | 不支援（需額外 Service） | 原生支援（hostgroup） |
-| 回滾方式 | 反向 patch selector 回 Blue | 反向更新 server list 回 Blue |
-| 適合階段 | **現階段** | 未來——需要讀寫分離或漸進式切換時 |
+| 維度 | 說明 |
+|------|------|
+| 切換動作 | `kubectl patch svc` 更新 selector 指向 Green Pods |
+| 切換粒度 | 全量切換（All-or-Nothing） |
+| 額外元件 | 無——K8s 原生機制 |
+| 回滾方式 | 反向 patch selector 回 Blue |
 
-#### Ingress Gateway 注意事項（兩種方案都適用）
+#### Ingress Gateway 注意事項
 
 | 注意事項 | 說明 |
 |---------|------|
@@ -345,23 +329,19 @@ Option B: 扇出式（Fan-out）
 
 #### 建議
 
-> 方案 A（K8s Service selector）——簡單、無額外依賴，適合現階段。
+> K8s Service selector——簡單、無額外依賴，適合現階段。
 
 #### 討論問題
 
 - [ ] 目前 Ingress Gateway 的 connection drain 和 health check 設定是什麼？
-- [ ] 是否有任何租戶需要讀寫分離？（影響是否需要 ProxySQL）
 - [ ] Gateway 層的連線快取行為是否已被理解和驗證？
-
-#### 結論
-
-> _（討論後填寫）_
 
 ---
 
 ### Decision 4：Switchover 期間的 Zone-B 處理
 
 **問題**：Switchover 期間和之後，Zone-B（DR）如何處理？
+**AWS 對照**：AWS Switchover 後，外部 Read Replica 需手動 `CHANGE REPLICATION SOURCE TO` 重新指向 Green。自建的 Zone-B 也需要相同處理。→ Section 6: Updating External Replicas
 **影響範圍**：影響 DR 可用性和 Switchover 後的恢復流程
 **前置決策**：Decision 0（行為完全取決於 D0 的選擇）
 
@@ -401,15 +381,12 @@ Zone-A 變成新的 DR。Replication 方向反轉。
 - [ ] Zone-B 重新指向（Option A）或重建（Option B）的預估時間？
 - [ ] Zone-B SLA：Switchover 期間 Replication 中斷可接受的最大間隔？
 
-#### 結論
-
-> _（討論後填寫）_
-
 ---
 
 ### Decision 5：交付格式
 
 **問題**：Blue/Green 流程的自動化程度做到什麼層級？
+**AWS 對照**：AWS 提供 Console UI + CLI + IAM 三層交付。自建環境需自行選擇工具鏈。→ Section 9: Best Practices + Section 10: IAM
 **影響範圍**：決定 Phase 1 的實作工作量和長期維護成本
 **前置決策**：無（獨立決策，可最後決定）
 
@@ -432,15 +409,12 @@ Zone-A 變成新的 DR。Replication 方向反轉。
 - [ ] 預計多久後需要從手動升級到半自動化？
 - [ ] 是否有計畫貢獻 mariadb-operator 上游？
 
-#### 結論
-
-> _（討論後填寫）_
-
 ---
 
 ### Decision 6：Guardrails 檢查
 
 **問題**：Switchover 執行前，必須通過哪些檢查項目？
+**AWS 對照**：AWS 內建 5 項 Guardrails（Replication Status、Lag、Long-running TX、Active DDL 等），任一失敗即取消 Switchover。自建需自行定義檢查清單。→ Section 6: Guardrails
 **影響範圍**：決定 Switchover 腳本中的 pre-flight check 清單
 **前置決策**：Decision 3（Switchover 機制確定後才能定義具體檢查項）
 
@@ -469,15 +443,12 @@ Zone-A 變成新的 DR。Replication 方向反轉。
 - [ ] pre-flight check 失敗時，是自動中止還是允許人工覆蓋？
 - [ ] 長時間交易（long-running tx）的定義門檻？（> 30s？> 60s？）
 
-#### 結論
-
-> _（討論後填寫）_
-
 ---
 
 ### Decision 7：回滾與 Timeout
 
 **問題**：Switchover 失敗時怎麼辦？等多久算失敗？
+**AWS 對照**：AWS 提供 Timeout 設定（30s–3600s，預設 300s），失敗自動回滾。自建需自行設計 Timeout 和 Rollback 邏輯。→ Section 6: Timeout Settings
 **影響範圍**：決定 Switchover 腳本中的 timeout 和 rollback 邏輯
 **前置決策**：Decision 3（回滾動作取決於 Switchover 機制）
 
@@ -510,15 +481,12 @@ Zone-A 變成新的 DR。Replication 方向反轉。
 - [ ] 是否需要「半自動 Rollback」（自動偵測失敗 + 人工確認回滾）？
 - [ ] Switchover 後多久內算「驗證期」？（驗證期內保留 Blue 環境）
 
-#### 結論
-
-> _（討論後填寫）_
-
 ---
 
 ### Decision 8：排程任務處理
 
 **問題**：Green 環境的 Event Scheduler 是否開啟？
+**AWS 對照**：AWS 明確要求 Green 的 `event_scheduler=OFF`，因為 Blue 的 Event DML 會透過 Replication 傳到 Green，重複執行會導致資料不一致。→ Section 5: Prerequisites
 **影響範圍**：避免 Blue 和 Green 同時執行排程任務導致資料不一致
 **前置決策**：Decision 0（需知道 Green 環境的建立方式）
 
@@ -539,10 +507,6 @@ Zone-A 變成新的 DR。Replication 方向反轉。
 
 - [ ] 目前有哪些 DB 實例使用 Event Scheduler？排程任務的用途？
 - [ ] 排程任務是否有冪等性？（即使重複執行也不會造成問題）
-
-#### 結論
-
-> _（討論後填寫）_
 
 ---
 
@@ -747,7 +711,7 @@ Step 1: 盤點審計
 
 Step 2: 團隊討論
   ├── 使用此文件逐項討論 Decision 0-8
-  ├── 填寫每個 Decision 的「結論」欄位
+  ├── 記錄每個 Decision 的選擇與理由
   └── 定義 Rollback 標準和 Switchover SLA
 
 Step 3: 選擇一個 Pilot 實例
