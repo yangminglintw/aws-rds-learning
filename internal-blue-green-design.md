@@ -131,6 +131,7 @@ Decision 5: 交付格式（獨立，可最後決定）
 
 > **AWS 對照**：AWS 自動複製整個 Topology（Primary + Replicas + Multi-AZ Standby）為 Green。自建環境無此自動化，需選擇策略。
 > → Section 3: How It Works
+
 **前置決策**：無（這是最上游的決策）
 
 #### 選項比較
@@ -212,6 +213,7 @@ Decision 5: 交付格式（獨立，可最後決定）
 
 > **AWS 對照**：AWS 自動 Snapshot Blue → Restore 為 Green，並支援 Lazy Loading。自建需自行選擇資料初始化方式。
 > → Section 5: Creating
+
 **前置決策**：Decision 0 = Option A（Option B 可跳過此決策，Zone-B 已有資料）
 
 #### 選項比較
@@ -242,6 +244,7 @@ Decision 5: 交付格式（獨立，可最後決定）
 
 > **AWS 對照**：AWS 自動配置 binlog replication（MySQL）或 WAL/Logical replication（PostgreSQL）。自建需決定 Replication 拓撲。
 > → Section 3: Replication Mechanism
+
 **前置決策**：Decision 0 = Option A
 
 #### 選項比較
@@ -281,6 +284,7 @@ Option B: 扇出式（Fan-out）
 
 > **AWS 對照**：AWS 透過 Endpoint Renaming（Instance Identifier 互換 + DNS TTL ≤ 5s）實現流量切換。自建環境使用 K8s Service selector 達到相同效果。
 > → Section 6: Switchover Steps
+
 **前置決策**：Decision 0（Option B 需額外處理 Layer 1）
 
 #### 連線路徑分層
@@ -353,6 +357,7 @@ Option B: 扇出式（Fan-out）
 
 > **AWS 對照**：AWS Switchover 後，外部 Read Replica 需手動 `CHANGE REPLICATION SOURCE TO` 重新指向 Green。自建的 Zone-B 也需要相同處理。
 > → Section 6: Updating External Replicas
+
 **前置決策**：Decision 0（行為完全取決於 D0 的選擇）
 
 #### 選項比較
@@ -400,6 +405,7 @@ Zone-A 變成新的 DR。Replication 方向反轉。
 
 > **AWS 對照**：AWS 提供 Console UI + CLI + IAM 三層交付。自建環境需自行選擇工具鏈。
 > → Section 9: Best Practices + Section 10: IAM
+
 **前置決策**：無（獨立決策，可最後決定）
 
 #### 選項比較
@@ -430,6 +436,7 @@ Zone-A 變成新的 DR。Replication 方向反轉。
 
 > **AWS 對照**：AWS 內建 5 項 Guardrails（Replication Status、Lag、Long-running TX、Active DDL 等），任一失敗即取消 Switchover。自建需自行定義檢查清單。
 > → Section 6: Guardrails
+
 **前置決策**：Decision 3（Switchover 機制確定後才能定義具體檢查項）
 
 #### 選項比較
@@ -466,6 +473,7 @@ Zone-A 變成新的 DR。Replication 方向反轉。
 
 > **AWS 對照**：AWS 提供 Timeout 設定（30s–3600s，預設 300s），失敗自動回滾。自建需自行設計 Timeout 和 Rollback 邏輯。
 > → Section 6: Timeout Settings
+
 **前置決策**：Decision 3（回滾動作取決於 Switchover 機制）
 
 #### 選項比較
@@ -506,6 +514,7 @@ Zone-A 變成新的 DR。Replication 方向反轉。
 
 > **AWS 對照**：AWS 明確要求 Green 的 `event_scheduler=OFF`，因為 Blue 的 Event DML 會透過 Replication 傳到 Green，重複執行會導致資料不一致。
 > → Section 5: Prerequisites
+
 **前置決策**：Decision 0（需知道 Green 環境的建立方式）
 
 #### 選項比較
