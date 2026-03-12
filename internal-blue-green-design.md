@@ -11,13 +11,11 @@
 - [3. 策略決策](#3-策略決策)
   - [Decision 0：策略選擇](#decision-0策略選擇new-green-vs-zone-b)
   - [Decision 1：Green 初始化](#decision-1green-環境初始化策略)
-  - [Decision 2：Replication 拓撲](#decision-2bluegreen-期間的-replication-拓撲)
   - [Decision 3：Switchover 機制](#decision-3switchover-機制)
   - [Decision 4：Zone-B 處理](#decision-4switchover-期間的-zone-b-處理)
   - [Decision 5：交付格式](#decision-5交付格式)
   - [Decision 6：Guardrails 檢查](#decision-6guardrails-檢查)
   - [Decision 7：回滾與 Timeout](#decision-7回滾與-timeout)
-  - [Decision 8：排程任務處理](#decision-8排程任務處理)
 - [4. 執行流程](#4-執行流程)
 - [5. 風險與緩解](#5-風險與緩解)
 - [6. 下一步行動](#6-下一步行動)
@@ -90,9 +88,7 @@
 ```
 Decision 0: 策略選擇（New Green vs Zone-B）
   ├──► Decision 1: Green 初始化（僅 Option A）
-  ├──► Decision 2: Replication 拓撲（僅 Option A）
   ├──► Decision 4: Zone-B 處理
-  ├──► Decision 8: 排程任務處理
   │
   ▼
 Decision 3: Switchover 機制
@@ -108,13 +104,11 @@ Decision 5: 交付格式（獨立，可最後決定）
 |---|----------|---------|-------|------|------|
 | 0 | 策略選擇 | New Green or reuse Zone-B？ | 3 | 無 | 視 DR SLA |
 | 1 | Green 初始化 | 資料怎麼來？ | 3 | D0=A | Snapshot |
-| 2 | Replication 拓撲 | Chain or Fan-out？ | 2 | D0=A | Chain |
-| 3 | Switchover 機制 | DB Cluster 內部如何切換流量？ | 1 | D0 | K8s Service |
+| 3 | Switchover 機制 | Green 測試連線 + Switchover 流量切換 | 1 | D0 | K8s Service |
 | 4 | Zone-B 處理 | Switchover 期間 DR 怎麼辦？ | - | D0 | 依 D0 |
 | 5 | 交付格式 | 自動化到什麼程度？ | 4 | 無 | Runbook 起步 |
 | 6 | Guardrails | Switchover 前查什麼？ | - | D3 | 新增 |
 | 7 | 回滾 + Timeout | 失敗怎麼辦？等多久？ | - | D3 | 新增 |
-| 8 | 排程任務 | Green Event Scheduler？ | 2 | D0 | 關閉 |
 
 ---
 
@@ -127,7 +121,7 @@ Decision 5: 交付格式（獨立，可最後決定）
 ### Decision 0：策略選擇（New Green vs Zone-B）
 
 **問題**：Blue/Green 策略要建立全新 Green Cluster，還是重用現有 Zone-B？
-**影響範圍**：Decision 1, 2, 3, 4, 8 的選項都取決於此
+**影響範圍**：Decision 1, 3, 4 的選項都取決於此
 
 > **AWS 對照**：AWS 自動複製整個 Topology（Primary + Replicas + Multi-AZ Standby）為 Green。自建環境無此自動化，需選擇策略。
 > → Section 3: How It Works
@@ -237,98 +231,25 @@ Decision 5: 交付格式（獨立，可最後決定）
 
 ---
 
-### Decision 2：Blue/Green 期間的 Replication 拓撲
-
-**問題**：Blue Primary 與 Green Cluster 之間的 Replication 用什麼拓撲？
-**影響範圍**：影響 Green 環境的同步延遲和 Blue Primary 負載
-
-> **AWS 對照**：AWS 自動配置 binlog replication（MySQL）或 WAL/Logical replication（PostgreSQL）。自建需決定 Replication 拓撲。
-> → Section 3: Replication Mechanism
-
-**前置決策**：Decision 0 = Option A
-
-#### 選項比較
-
-```
-Option A: 簡單鏈式（Simple Chain）
-  Blue Primary ──GTID async──► Green Primary ──semi-sync──► Green R1, R2
-
-Option B: 扇出式（Fan-out）
-  Blue Primary ──GTID async──► Green Primary
-  Blue Primary ──GTID async──► Green R1
-  Blue Primary ──GTID async──► Green R2
-```
-
-| 維度 | A. Simple Chain | B. Fan-out |
-|------|----------------|------------|
-| 與 operator 相容性 | ✅ Green 作為獨立 CR 管理 | ❌ 與 operator 管理模式衝突 |
-| Blue Primary 負載 | 低（只有一條 Replication） | 高（多條 Replication） |
-| Green Replica 延遲 | 較高（經過 Green Primary 中轉） | 較低（直接從 Blue 同步） |
-| 單點風險 | Green Primary 是單點 | 無 |
-
-#### 建議
-
-> Option A（Simple Chain）——Green Cluster 由自己的 MariaDB CR 管理，Green Primary 從 Blue Primary 複製。
-
-#### 討論問題
-
-- [ ] Green Replica 延遲增加（Chain 中轉）是否影響驗證測試的準確性？
-- [ ] operator 是否確實不支援外部 Replication 管理？
-
----
-
 ### Decision 3：Switchover 機制
 
-**問題**：DB Cluster 內部用什麼機制切換流量（Layer 2）？
-**影響範圍**：Decision 6, 7 的設計都建立在此機制之上
+**問題**：Switchover 時，如何把 App 流量從 Blue 切到 Green？包含切換前的 Green 測試連線和切換時的流量轉移。
+**影響範圍**：D6（Guardrails 的「端到端連線驗證」依賴此機制）、D7（Rollback 動作依賴 selector 反向切換）
 
-> **AWS 對照**：AWS 透過 Endpoint Renaming（Instance Identifier 互換 + DNS TTL ≤ 5s）實現流量切換。自建環境使用 K8s Service selector 達到相同效果。
-> → Section 6: Switchover Steps
+> **AWS 對照**：AWS 為 Green 環境提供獨立的臨時 endpoint 供測試，Switchover 時透過 Endpoint Renaming（Instance Identifier 互換 + DNS TTL ≤ 5s）實現流量切換。自建環境需自行建立 Green 測試用 K8s Service，Switchover 時透過 Service selector 切換。
+> → Section 1: FAQ（Green 臨時 endpoint）、Section 6: Switchover Steps
 
-**前置決策**：Decision 0（Option B 需額外處理 Layer 1）
+**前置決策**：D0 決定 Green 在哪個 Zone——同 Zone（Option A）只改 Layer 2；跨 Zone（Option B）需同時改 Layer 1 的 Gateway 路由
 
-#### 連線路徑分層
+#### 連線路徑與切換方式
 
-```
-┌─ Layer 1：跨叢集（固定不變）───────────────────────────────────────────┐
-│                                                                      │
-│   App Cluster ──────► Ingress Gateway ──────► DB K8s Cluster         │
-│                                                                      │
-│   · Ingress Gateway 是跨叢集的固定入口                                  │
-│   · Option A（同 Zone 切換）：Layer 1 不需要修改                         │
-│   · Option B（跨 Zone 切換）：Layer 1 的 Gateway 路由目標需要更新          │
-│                                                                      │
-└──────────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─ Layer 2：DB Cluster 內部（Switchover 的決策點）─────────────────────────┐
-│                                                                      │
-│   K8s Service selector：                                              │
-│     Ingress GW → K8s Service ──selector──► MariaDB Pods              │
-│     切換方式：更新 Service 的 selector 指向 Green Pods                   │
-│                                                                      │
-└──────────────────────────────────────────────────────────────────────┘
-```
+App 到 DB 的連線經過兩層，Switchover 只需改 Layer 2：
 
-#### DB-level 共用步驟（與 Layer 2 方案無關）
+  App Cluster → Ingress Gateway (Layer 1, 固定) → K8s Service (Layer 2, 切換點) → MariaDB Pods
 
-| 順序 | 操作 | 說明 |
-|------|------|------|
-| 1 | Blue: `SET GLOBAL read_only=ON` | 阻擋新寫入，**寫入暫停開始** |
-| 2 | 等待 GTID sync | 確認 Green 已追上 Blue 最後的 GTID |
-| 3 | Green: `STOP SLAVE; RESET SLAVE ALL;` | 切斷 Blue → Green 的 Replication |
-| 4 | Green: `read_only=OFF` | Green 準備接受寫入 |
-| 5 | **切換流量** | ← Layer 2 方案決定如何執行 |
-| 6 | 驗證端到端連線 | 確認 App 透過 Ingress Gateway → Green 正常讀寫，**寫入暫停結束** |
-
-#### K8s Service selector 行為說明
-
-| 維度 | 說明 |
-|------|------|
-| 切換動作 | `kubectl patch svc` 更新 selector 指向 Green Pods |
-| 切換粒度 | 全量切換（All-or-Nothing） |
-| 額外元件 | 無——K8s 原生機制 |
-| 回滾方式 | 反向 patch selector 回 Blue |
+- **Green 測試階段**：建立臨時 K8s Service 指向 Green Pods，供驗證使用
+- **Switchover**：`kubectl patch svc` 更新正式 Service 的 selector 從 Blue → Green
+- **Rollback**：反向 patch selector 回 Blue
 
 #### Ingress Gateway 注意事項
 
@@ -338,10 +259,6 @@ Option B: 扇出式（Fan-out）
 | 連線殘留 | 如果 Gateway 快取 backend 連線，stale 連線必須被 drain |
 | Health Check 設定 | Gateway 的 Health Check 應能快速偵測 backend 變更 |
 | Connection Timeout | Gateway 上的 timeout 設定影響 App 多快看到新 backend |
-
-#### 建議
-
-> K8s Service selector——簡單、無額外依賴，適合現階段。
 
 #### 討論問題
 
@@ -507,39 +424,9 @@ Zone-A 變成新的 DR。Replication 方向反轉。
 
 ---
 
-### Decision 8：排程任務處理
-
-**問題**：Green 環境的 Event Scheduler 是否開啟？
-**影響範圍**：避免 Blue 和 Green 同時執行排程任務導致資料不一致
-
-> **AWS 對照**：AWS 明確要求 Green 的 `event_scheduler=OFF`，因為 Blue 的 Event DML 會透過 Replication 傳到 Green，重複執行會導致資料不一致。
-> → Section 5: Prerequisites
-
-**前置決策**：Decision 0（需知道 Green 環境的建立方式）
-
-#### 選項比較
-
-| 維度 | A. Green Event Scheduler 關閉 | B. Green Event Scheduler 開啟 |
-|------|------------------------------|------------------------------|
-| 資料一致性 | ✅ 安全——只有 Blue 執行排程任務 | ❌ 風險——Blue 和 Green 可能同時執行 |
-| 設定方式 | Green CR 中設定 `event_scheduler=OFF` | 依賴 Replication filter 或 app-level 防護 |
-| Switchover 後動作 | 手動開啟 Green 的 Event Scheduler | 無需額外動作 |
-| 複雜度 | 低 | 高 |
-
-#### 建議
-
-> 關閉 Green 的 Event Scheduler，Switchover 完成後再手動開啟。
-
-#### 討論問題
-
-- [ ] 目前有哪些 DB 實例使用 Event Scheduler？排程任務的用途？
-- [ ] 排程任務是否有冪等性？（即使重複執行也不會造成問題）
-
----
-
 ## 4. 執行流程
 
-> 根據 Decision 0-8 的結果，對應的完整執行流程。
+> 根據 Decision 0-7 的結果，對應的完整執行流程。
 
 ### 4.1 Option A 流程：建立新 Green Cluster
 
@@ -570,7 +457,7 @@ Zone-A 變成新的 DR。Replication 方向反轉。
 | 步驟 | 操作 | 備註 |
 |------|------|------|
 | 1 | Snapshot Blue Primary 的 PVC（或 Backup） | 優先使用 Volume Snapshot |
-| 2 | 建立新的 MariaDB CR（Green），使用目標版本/設定 | 需新 CR 名稱 |
+| 2 | 建立新的 MariaDB CR（Green），使用目標版本/設定，`event_scheduler=OFF` | 需新 CR 名稱 |
 | 3 | 將資料還原到 Green Primary | 從 Snapshot 或 Backup 還原 |
 | 4 | 設定 GTID Replication：Green Primary → 從 Blue Primary 複製 | `CHANGE MASTER TO MASTER_USE_GTID=slave_pos` |
 | 5 | 等待 Green 追上（`Seconds_Behind_Master = 0`） | 時間取決於資料量和寫入速度 |
@@ -737,7 +624,7 @@ Step 1: 盤點審計
   └── 收集附錄 C 的所有資訊
 
 Step 2: 團隊討論
-  ├── 使用此文件逐項討論 Decision 0-8
+  ├── 使用此文件逐項討論 Decision 0-7
   ├── 記錄每個 Decision 的選擇與理由
   └── 定義 Rollback 標準和 Switchover SLA
 
